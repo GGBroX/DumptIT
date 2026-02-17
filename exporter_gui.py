@@ -64,6 +64,506 @@ def normalize_patterns(patterns: list[str]) -> list[str]:
 def rel_posix(root: Path, file_path: Path) -> str:
     return file_path.relative_to(root).as_posix()
 
+
 def should_skip_by_dir(rel_path: Path, exclude_dirs: set[str]) -> bool:
     return any(part in exclude_dirs for part in rel_path.parts)
 
+
+def is_probably_binary(p: Path) -> bool:
+    try:
+        with p.open("rb") as f:
+            chunk = f.read(8192)
+        return b"\x00" in chunk
+    except Exception:
+        return True
+
+
+def read_text_safely(p: Path) -> str:
+    for enc in ("utf-8-sig", "utf-8"):
+        try:
+            return p.read_text(encoding=enc)
+        except UnicodeDecodeError:
+            pass
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def matches_any(rel_path_posix: str, name: str, patterns: list[str]) -> bool:
+    rp = rel_path_posix.lower()
+    nm = name.lower()
+    for pat in patterns:
+        if ("/" in pat) or ("\\" in pat):
+            if fnmatch.fnmatch(rp, pat.replace("\\", "/")):
+                return True
+        else:
+            if fnmatch.fnmatch(nm, pat):
+                return True
+    return False
+
+
+def collect_files(root: Path, exclude_dirs: set[str], patterns: list[str], skip_binary: bool) -> list[Path]:
+    files: list[Path] = []
+    for p in root.rglob("*"):
+        if p.is_dir():
+            continue
+        rel = p.relative_to(root)
+        if should_skip_by_dir(rel, exclude_dirs):
+            continue
+
+        rp = rel.as_posix()
+        if not matches_any(rp, p.name, patterns):
+            continue
+
+        if skip_binary and is_probably_binary(p):
+            continue
+
+        files.append(p)
+
+    files.sort(key=lambda x: str(x).lower())
+    return files
+
+
+def build_default_output(root: Path, add_ts: bool) -> Path:
+    name = root.name
+    if add_ts:
+        name += "_" + datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    return root / f"{name}.txt"
+
+
+def export_to_file(root: Path, out_path: Path, exclude_dirs: set[str], patterns: list[str],
+                   skip_binary: bool, header_full_path: bool) -> tuple[int, int]:
+    files = collect_files(root, exclude_dirs, patterns, skip_binary)
+    skipped = 0
+
+    parts: list[str] = []
+    for p in files:
+        header = str(p) if header_full_path else rel_posix(root, p)
+        parts.append(f"===== FILE: {header} =====\n")
+        try:
+            parts.append(read_text_safely(p))
+        except Exception:
+            skipped += 1
+            parts.append("[[ERROR reading file]]\n")
+        if not parts[-1].endswith("\n"):
+            parts.append("\n")
+        parts.append("\n")
+
+    ensure_parent_dir(out_path)
+    out_path.write_text("".join(parts), encoding="utf-8")
+    return (len(files) - skipped, skipped)
+
+
+def sanitize_profile_name(name: str) -> str:
+    name = (name or "").strip()
+    name = name.replace("\n", " ").replace("\r", " ").strip()
+    # evita caratteri “problematici” per sezioni ini
+    for bad in [":", "[", "]"]:
+        name = name.replace(bad, "-")
+    return name
+
+
+class DumpItApp(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("DumpIt — Source Exporter")
+        self.geometry("860x560")
+        self.minsize(860, 560)
+
+        # State base
+        self.project_dir = tk.StringVar(value=str(get_default_project_dir()))
+        self.include_patterns = tk.StringVar(value=DEFAULT_INCLUDE)
+        self.exclude_dirs = tk.StringVar(value=DEFAULT_EXCLUDE_DIRS)
+        self.add_timestamp = tk.BooleanVar(value=False)
+        self.skip_binary = tk.BooleanVar(value=True)
+        self.header_full_path = tk.BooleanVar(value=False)
+        self.output_file = tk.StringVar(value="")
+
+        # Profiles
+        self.profile_name = tk.StringVar(value="Default")
+        self._loading_ui = False
+        self._cp = configparser.ConfigParser()
+        self.config_path = get_config_path()
+
+        self._build_ui()
+
+        self._load_config()
+        self._ensure_output_default()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---------- UI ----------
+    def _build_ui(self) -> None:
+        pad = {"padx": 10, "pady": 6}
+        root = ttk.Frame(self)
+        root.pack(fill="both", expand=True, **pad)
+
+        # Profiles frame
+        lf0 = ttk.LabelFrame(root, text="Profile")
+        lf0.pack(fill="x", **pad)
+        row0 = ttk.Frame(lf0)
+        row0.pack(fill="x", padx=8, pady=8)
+
+        ttk.Label(row0, text="Config:").pack(side="left")
+        self.cb_profiles = ttk.Combobox(row0, textvariable=self.profile_name, state="readonly", width=24)
+        self.cb_profiles.pack(side="left", padx=8)
+        self.cb_profiles.bind("<<ComboboxSelected>>", self._on_profile_selected)
+
+        ttk.Button(row0, text="New…", command=self._profile_new).pack(side="left", padx=4)
+        ttk.Button(row0, text="Rename…", command=self._profile_rename).pack(side="left", padx=4)
+        ttk.Button(row0, text="Delete", command=self._profile_delete).pack(side="left", padx=4)
+
+        # Project folder
+        lf1 = ttk.LabelFrame(root, text="Project folder")
+        lf1.pack(fill="x", **pad)
+        ttk.Entry(lf1, textvariable=self.project_dir).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        ttk.Button(lf1, text="Browse…", command=self._browse_project).pack(side="left", padx=8, pady=8)
+
+        # Include patterns
+        lf2 = ttk.LabelFrame(root, text="Include patterns (comma-separated, ex: *.al,app.json,*.gd)")
+        lf2.pack(fill="x", **pad)
+        ttk.Entry(lf2, textvariable=self.include_patterns).pack(fill="x", padx=8, pady=8)
+
+        # Exclude dirs
+        lf3 = ttk.LabelFrame(root, text="Exclude folders (comma-separated, match by folder name)")
+        lf3.pack(fill="x", **pad)
+        ttk.Entry(lf3, textvariable=self.exclude_dirs).pack(fill="x", padx=8, pady=8)
+
+        # Output
+        lf4 = ttk.LabelFrame(root, text="Output file")
+        lf4.pack(fill="x", **pad)
+        ttk.Entry(lf4, textvariable=self.output_file).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        ttk.Button(lf4, text="Choose…", command=self._choose_output).pack(side="left", padx=8, pady=8)
+
+        # Options
+        lf5 = ttk.LabelFrame(root, text="Options")
+        lf5.pack(fill="x", **pad)
+        opt = ttk.Frame(lf5)
+        opt.pack(fill="x", padx=8, pady=8)
+
+        ttk.Checkbutton(opt, text="Add timestamp to output name", variable=self.add_timestamp,
+                        command=self._suggest_output_if_default).grid(row=0, column=0, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(opt, text="Skip binary files (recommended)", variable=self.skip_binary).grid(
+            row=0, column=1, sticky="w", padx=6, pady=2
+        )
+        ttk.Checkbutton(opt, text="Header = full path (instead of relative)", variable=self.header_full_path).grid(
+            row=1, column=0, sticky="w", padx=6, pady=2
+        )
+
+        # Actions
+        actions = ttk.Frame(root)
+        actions.pack(fill="x", **pad)
+        ttk.Button(actions, text="Preview", command=self._preview).pack(side="left", padx=4)
+        ttk.Button(actions, text="Export", command=self._export).pack(side="left", padx=4)
+        ttk.Button(actions, text="Save profile", command=self._save_config).pack(side="left", padx=16)
+        ttk.Button(actions, text="Reset defaults", command=self._reset_defaults).pack(side="left", padx=4)
+
+        # Log
+        self.log = tk.Text(root, height=10, wrap="word")
+        self.log.pack(fill="both", expand=True, **pad)
+        self.log.configure(state="disabled")
+
+        # Footer
+        footer = ttk.Frame(root)
+        footer.pack(fill="x", **pad)
+        self.lbl_cfg = ttk.Label(footer, text=f"Config: {self.config_path}")
+        self.lbl_cfg.pack(side="left")
+
+    def _log(self, msg: str) -> None:
+        self.log.configure(state="normal")
+        self.log.insert("end", msg + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    # ---------- Project / Output ----------
+    def _browse_project(self) -> None:
+        d = filedialog.askdirectory(title="Select project folder", initialdir=self.project_dir.get() or str(get_default_project_dir()))
+        if d:
+            self.project_dir.set(d)
+            self._suggest_output_if_default()
+
+    def _choose_output(self) -> None:
+        root = Path(self.project_dir.get()).resolve()
+        initial = build_default_output(root, self.add_timestamp.get())
+        f = filedialog.asksaveasfilename(
+            title="Choose output file",
+            initialdir=str(root),
+            initialfile=initial.name,
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt"), ("All files", "*.*")]
+        )
+        if f:
+            self.output_file.set(f)
+
+    def _ensure_output_default(self) -> None:
+        if not self.output_file.get().strip():
+            root = Path(self.project_dir.get()).resolve()
+            self.output_file.set(str(build_default_output(root, self.add_timestamp.get())))
+
+    def _suggest_output_if_default(self) -> None:
+        try:
+            root = Path(self.project_dir.get()).resolve()
+            current = self.output_file.get().strip()
+            if not current:
+                self.output_file.set(str(build_default_output(root, self.add_timestamp.get())))
+                return
+            curp = Path(current).resolve()
+            if curp.parent == root and curp.stem.startswith(root.name):
+                self.output_file.set(str(build_default_output(root, self.add_timestamp.get())))
+        except Exception:
+            pass
+
+    # ---------- Export ----------
+    def _preview(self) -> None:
+        try:
+            root = Path(self.project_dir.get()).resolve()
+            if not root.exists():
+                messagebox.showerror("Error", "Project folder does not exist.")
+                return
+
+            patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
+            exclude = set(parse_csv_list(self.exclude_dirs.get()))
+            files = collect_files(root, exclude, patterns, self.skip_binary.get())
+            self._log(f"Preview: {len(files)} files will be included from: {root}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _export(self) -> None:
+        try:
+            root = Path(self.project_dir.get()).resolve()
+            if not root.exists():
+                messagebox.showerror("Error", "Project folder does not exist.")
+                return
+
+            patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
+            exclude = set(parse_csv_list(self.exclude_dirs.get()))
+
+            out = self.output_file.get().strip()
+            out_path = Path(out).resolve() if out else build_default_output(root, self.add_timestamp.get())
+
+            included, skipped = export_to_file(
+                root=root,
+                out_path=out_path,
+                exclude_dirs=exclude,
+                patterns=patterns,
+                skip_binary=self.skip_binary.get(),
+                header_full_path=self.header_full_path.get(),
+            )
+
+            self._save_config(silent=True)
+            self._log(f"OK: exported {included} files -> {out_path} (skipped read errors: {skipped})")
+            messagebox.showinfo("Done", f"Export completed.\nIncluded: {included}\nSkipped read errors: {skipped}\nOutput: {out_path}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # ---------- Profiles / Config ----------
+    def _profile_section(self, name: str) -> str:
+        return f"{PROFILE_PREFIX}{name}"
+
+    def _get_profile_names(self) -> list[str]:
+        names: list[str] = []
+        for sec in self._cp.sections():
+            if sec.lower().startswith(PROFILE_PREFIX):
+                names.append(sec[len(PROFILE_PREFIX):])
+        names.sort(key=lambda x: x.lower())
+        return names
+
+    def _refresh_profile_combo(self) -> None:
+        names = self._get_profile_names()
+        if not names:
+            names = ["Default"]
+        self.cb_profiles["values"] = names
+        cur = self.profile_name.get().strip()
+        if cur not in names:
+            self.profile_name.set(names[0])
+
+    def _ensure_minimum_config(self) -> None:
+        if SECTION_APP not in self._cp:
+            self._cp[SECTION_APP] = {}
+        if "active_profile" not in self._cp[SECTION_APP]:
+            self._cp[SECTION_APP]["active_profile"] = "Default"
+
+        # se non esistono profili, creane uno Default
+        if not self._get_profile_names():
+            self._cp[self._profile_section("Default")] = {
+                "include_patterns": DEFAULT_INCLUDE,
+                "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
+                "add_timestamp": "False",
+                "skip_binary": "True",
+                "header_full_path": "False",
+            }
+
+    def _apply_profile_to_ui(self, name: str) -> None:
+        sec = self._profile_section(name)
+        if sec not in self._cp:
+            # fallback: crea dal default
+            self._cp[sec] = {
+                "include_patterns": DEFAULT_INCLUDE,
+                "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
+                "add_timestamp": "False",
+                "skip_binary": "True",
+                "header_full_path": "False",
+            }
+
+        s = self._cp[sec]
+        self._loading_ui = True
+        try:
+            self.include_patterns.set(s.get("include_patterns", DEFAULT_INCLUDE))
+            self.exclude_dirs.set(s.get("exclude_dirs", DEFAULT_EXCLUDE_DIRS))
+            self.add_timestamp.set(s.getboolean("add_timestamp", fallback=False))
+            self.skip_binary.set(s.getboolean("skip_binary", fallback=True))
+            self.header_full_path.set(s.getboolean("header_full_path", fallback=False))
+            self._suggest_output_if_default()
+        finally:
+            self._loading_ui = False
+
+    def _write_ui_to_profile(self, name: str) -> None:
+        sec = self._profile_section(name)
+        if sec not in self._cp:
+            self._cp[sec] = {}
+        self._cp[sec]["include_patterns"] = self.include_patterns.get()
+        self._cp[sec]["exclude_dirs"] = self.exclude_dirs.get()
+        self._cp[sec]["add_timestamp"] = str(self.add_timestamp.get())
+        self._cp[sec]["skip_binary"] = str(self.skip_binary.get())
+        self._cp[sec]["header_full_path"] = str(self.header_full_path.get())
+
+    def _load_config(self) -> None:
+        # carica ini
+        if self.config_path.exists():
+            try:
+                self._cp.read(self.config_path, encoding="utf-8")
+            except Exception:
+                self._cp = configparser.ConfigParser()
+
+        self._ensure_minimum_config()
+
+        # active profile
+        active = self._cp[SECTION_APP].get("active_profile", "Default")
+        self.profile_name.set(active)
+
+        self._refresh_profile_combo()
+        self._apply_profile_to_ui(self.profile_name.get())
+
+        self._log(f"Loaded config: {self.config_path}")
+
+    def _save_config(self, silent: bool = False) -> None:
+        try:
+            self._ensure_minimum_config()
+            current = self.profile_name.get().strip() or "Default"
+            self._write_ui_to_profile(current)
+            self._cp[SECTION_APP]["active_profile"] = current
+
+            ensure_parent_dir(self.config_path)
+            with self.config_path.open("w", encoding="utf-8") as f:
+                self._cp.write(f)
+
+            if not silent:
+                self._log(f"Saved config: {self.config_path}")
+                messagebox.showinfo("Saved", f"Profile saved:\n{current}\n\nConfig file:\n{self.config_path}")
+        except Exception as e:
+            if not silent:
+                messagebox.showerror("Error", str(e))
+
+    def _on_profile_selected(self, _evt=None) -> None:
+        if self._loading_ui:
+            return
+        # salva profilo corrente prima di cambiare (auto-save)
+        self._save_config(silent=True)
+
+        name = self.profile_name.get().strip()
+        self._cp[SECTION_APP]["active_profile"] = name
+        self._apply_profile_to_ui(name)
+        self._save_config(silent=True)
+        self._log(f"Switched profile: {name}")
+
+    def _profile_new(self) -> None:
+        name = simpledialog.askstring("New profile", "Profile name:")
+        name = sanitize_profile_name(name or "")
+        if not name:
+            return
+        sec = self._profile_section(name)
+        if sec in self._cp:
+            messagebox.showerror("Error", f"Profile already exists: {name}")
+            return
+
+        # crea copiando i valori correnti (più comodo)
+        self._write_ui_to_profile(self.profile_name.get().strip() or "Default")
+        self._cp[sec] = dict(self._cp[self._profile_section(self.profile_name.get().strip() or "Default")])
+
+        self.profile_name.set(name)
+        self._cp[SECTION_APP]["active_profile"] = name
+        self._refresh_profile_combo()
+        self._apply_profile_to_ui(name)
+        self._save_config(silent=True)
+        self._log(f"Created profile: {name}")
+
+    def _profile_rename(self) -> None:
+        old = self.profile_name.get().strip()
+        if not old:
+            return
+        new = simpledialog.askstring("Rename profile", f"New name for '{old}':")
+        new = sanitize_profile_name(new or "")
+        if not new or new == old:
+            return
+
+        old_sec = self._profile_section(old)
+        new_sec = self._profile_section(new)
+
+        if new_sec in self._cp:
+            messagebox.showerror("Error", f"Profile already exists: {new}")
+            return
+        if old_sec not in self._cp:
+            messagebox.showerror("Error", f"Profile not found: {old}")
+            return
+
+        self._cp[new_sec] = dict(self._cp[old_sec])
+        self._cp.remove_section(old_sec)
+
+        self.profile_name.set(new)
+        self._cp[SECTION_APP]["active_profile"] = new
+        self._refresh_profile_combo()
+        self._save_config(silent=True)
+        self._log(f"Renamed profile: {old} -> {new}")
+
+    def _profile_delete(self) -> None:
+        name = self.profile_name.get().strip()
+        if not name:
+            return
+        names = self._get_profile_names()
+        if len(names) <= 1:
+            messagebox.showerror("Error", "You cannot delete the last profile.")
+            return
+
+        if not messagebox.askyesno("Delete profile", f"Delete profile '{name}'?"):
+            return
+
+        sec = self._profile_section(name)
+        if sec in self._cp:
+            self._cp.remove_section(sec)
+
+        # scegli un altro profilo come active
+        remaining = self._get_profile_names()
+        new_active = remaining[0] if remaining else "Default"
+        self.profile_name.set(new_active)
+        self._cp[SECTION_APP]["active_profile"] = new_active
+        self._refresh_profile_combo()
+        self._apply_profile_to_ui(new_active)
+        self._save_config(silent=True)
+        self._log(f"Deleted profile: {name}")
+
+    def _reset_defaults(self) -> None:
+        # resetta SOLO i campi della UI (poi "Save profile" per salvarli nel profilo selezionato)
+        self.include_patterns.set(DEFAULT_INCLUDE)
+        self.exclude_dirs.set(DEFAULT_EXCLUDE_DIRS)
+        self.add_timestamp.set(False)
+        self.skip_binary.set(True)
+        self.header_full_path.set(False)
+        self.output_file.set("")
+        self._ensure_output_default()
+        self._log("Reset to defaults (not saved yet).")
+
+    def _on_close(self) -> None:
+        self._save_config(silent=True)
+        self.destroy()
+
+
+if __name__ == "__main__":
+    DumpItApp().mainloop()
