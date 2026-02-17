@@ -565,5 +565,29 @@ class DumpItApp(tk.Tk):
         self.destroy()
 
 
+def _crash_log_path() -> Path:
+    # log nel config folder (stesso posto del dumpit.ini)
+    p = get_config_path()
+    return p.with_suffix(".crash.log")
+
+def main() -> None:
+    try:
+        app = DumpItApp()
+
+        # cattura errori anche dentro callback Tkinter
+        def _tk_report(exc, val, tb):
+            import traceback
+            _crash_log_path().write_text("".join(traceback.format_exception(exc, val, tb)), encoding="utf-8")
+            messagebox.showerror("DumpIt crash", f"Error saved to:\n{_crash_log_path()}")
+
+        app.report_callback_exception = _tk_report  # type: ignore
+        app.mainloop()
+    except Exception as e:
+        import traceback
+        _crash_log_path().write_text(traceback.format_exc(), encoding="utf-8")
+        # su build -w non vedrai niente, ma il file log resta
+        raise
+
 if __name__ == "__main__":
-    DumpItApp().mainloop()
+    main()
+
