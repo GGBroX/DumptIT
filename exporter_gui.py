@@ -64,6 +64,6 @@ def normalize_patterns(patterns: list[str]) -> list[str]:
 def rel_posix(root: Path, file_path: Path) -> str:
     return file_path.relative_to(root).as_posix()
 
-
 def should_skip_by_dir(rel_path: Path, exclude_dirs: set[str]) -> bool:
-    return any(part in exclude_dirs for part in rel_pat
+    return any(part in exclude_dirs for part in rel_path.parts)
+
