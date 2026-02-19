@@ -234,6 +234,12 @@ class DumpItApp(tk.Tk):
         ttk.Button(row0, text="Rename…", command=self._profile_rename).pack(side="left", padx=4)
         ttk.Button(row0, text="Delete", command=self._profile_delete).pack(side="left", padx=4)
 
+        # Profile actions (keep near profile selector)
+        row0_actions = ttk.Frame(lf0)
+        row0_actions.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(row0_actions, text="Reset defaults", command=self._reset_defaults).pack(side="right", padx=4)
+        ttk.Button(row0_actions, text="Save profile", command=self._save_config).pack(side="right", padx=4)
+
         # Project folder
         lf1 = ttk.LabelFrame(root, text="Project folder")
         lf1.pack(fill="x", **pad)
@@ -276,8 +282,6 @@ class DumpItApp(tk.Tk):
         actions.pack(fill="x", **pad)
         ttk.Button(actions, text="Preview", command=self._preview).pack(side="left", padx=4)
         ttk.Button(actions, text="Export", command=self._export).pack(side="left", padx=4)
-        ttk.Button(actions, text="Save profile", command=self._save_config).pack(side="left", padx=16)
-        ttk.Button(actions, text="Reset defaults", command=self._reset_defaults).pack(side="left", padx=4)
 
         # Log
         self.log = tk.Text(root, height=10, wrap="word")
@@ -486,6 +490,8 @@ class DumpItApp(tk.Tk):
         # se non esistono profili, creane uno Default
         if not self._get_profile_names():
             self._cp[self._profile_section("Default")] = {
+                "project_dir": str(get_default_project_dir()),
+                "output_file": "",
                 "include_patterns": DEFAULT_INCLUDE,
                 "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
                 "add_timestamp": "False",
@@ -500,6 +506,8 @@ class DumpItApp(tk.Tk):
         if sec_real not in self._cp:
             # fallback: crea dal default
             self._cp[sec_real] = {
+                "project_dir": str(get_default_project_dir()),
+                "output_file": "",
                 "include_patterns": DEFAULT_INCLUDE,
                 "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
                 "add_timestamp": "False",
@@ -510,12 +518,19 @@ class DumpItApp(tk.Tk):
         s = self._cp[sec_real]
         self._loading_ui = True
         try:
+            # NB: project_dir e output_file SONO parte del profilo
+            self.project_dir.set(normalize_ui_path(s.get("project_dir", self.project_dir.get())))
+
             self.include_patterns.set(s.get("include_patterns", DEFAULT_INCLUDE))
             self.exclude_dirs.set(s.get("exclude_dirs", DEFAULT_EXCLUDE_DIRS))
             self.add_timestamp.set(s.getboolean("add_timestamp", fallback=False))
             self.skip_binary.set(s.getboolean("skip_binary", fallback=True))
             self.header_full_path.set(s.getboolean("header_full_path", fallback=False))
-            self._suggest_output_if_default()
+
+            self.output_file.set(normalize_ui_path(s.get("output_file", "")))
+
+            # Se il profilo non ha output_file, calcolane uno di default per quella project_dir
+            self._ensure_output_default()
         finally:
             self._loading_ui = False
 
@@ -524,6 +539,11 @@ class DumpItApp(tk.Tk):
         sec_real = self._sec_ci(sec) or sec
         if sec_real not in self._cp:
             self._cp[sec_real] = {}
+
+        # project/output per profilo
+        self._cp[sec_real]["project_dir"] = normalize_ui_path(self.project_dir.get())
+        self._cp[sec_real]["output_file"] = normalize_ui_path(self.output_file.get())
+
         self._cp[sec_real]["include_patterns"] = self.include_patterns.get()
         self._cp[sec_real]["exclude_dirs"] = self.exclude_dirs.get()
         self._cp[sec_real]["add_timestamp"] = str(self.add_timestamp.get())
