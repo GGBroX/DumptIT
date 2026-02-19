@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from typing import Optional, Set
+
 import os
 import sys
 import platform
@@ -61,12 +63,26 @@ def normalize_patterns(patterns: list[str]) -> list[str]:
     return out
 
 
+
+def normalize_ui_path(p: str) -> str:
+    """Normalize a path string for the current OS (fixes Tk forward slashes on Windows)."""
+    p = (p or "").strip()
+    if not p:
+        return p
+    return os.path.normpath(p)
+
+
+def canon_path(p: Path) -> str:
+    """Canonical path string for comparisons (case-insensitive on Windows)."""
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
 def rel_posix(root: Path, file_path: Path) -> str:
     return file_path.relative_to(root).as_posix()
 
 
 def should_skip_by_dir(rel_path: Path, exclude_dirs: set[str]) -> bool:
-    return any(part in exclude_dirs for part in rel_path.parts)
+    return any(part.lower() in exclude_dirs for part in rel_path.parts)
 
 
 def is_probably_binary(p: Path) -> bool:
@@ -100,10 +116,15 @@ def matches_any(rel_path_posix: str, name: str, patterns: list[str]) -> bool:
     return False
 
 
-def collect_files(root: Path, exclude_dirs: set[str], patterns: list[str], skip_binary: bool) -> list[Path]:
+def collect_files(root: Path, exclude_dirs: set[str], patterns: list[str], skip_binary: bool, exclude_files: Optional[Set[str]] = None) -> list[Path]:
     files: list[Path] = []
+    exclude_files = exclude_files or set()
     for p in root.rglob("*"):
         if p.is_dir():
+            continue
+
+        # Avoid including the output file itself (can cause huge/infinite-looking exports)
+        if exclude_files and canon_path(p) in exclude_files:
             continue
         rel = p.relative_to(root)
         if should_skip_by_dir(rel, exclude_dirs):
@@ -131,7 +152,8 @@ def build_default_output(root: Path, add_ts: bool) -> Path:
 
 def export_to_file(root: Path, out_path: Path, exclude_dirs: set[str], patterns: list[str],
                    skip_binary: bool, header_full_path: bool) -> tuple[int, int]:
-    files = collect_files(root, exclude_dirs, patterns, skip_binary)
+    exclude_files = {canon_path(out_path)}
+    files = collect_files(root, exclude_dirs, patterns, skip_binary, exclude_files=exclude_files)
     skipped = 0
 
     parts: list[str] = []
@@ -182,6 +204,7 @@ class DumpItApp(tk.Tk):
         self._loading_ui = False
         self._cp = configparser.ConfigParser()
         self.config_path = get_config_path()
+        self._active_profile = "Default"  # profile currently applied to the UI
 
         self._build_ui()
 
@@ -277,11 +300,11 @@ class DumpItApp(tk.Tk):
     def _browse_project(self) -> None:
         d = filedialog.askdirectory(title="Select project folder", initialdir=self.project_dir.get() or str(get_default_project_dir()))
         if d:
-            self.project_dir.set(d)
+            self.project_dir.set(normalize_ui_path(d))
             self._suggest_output_if_default()
 
     def _choose_output(self) -> None:
-        root = Path(self.project_dir.get()).resolve()
+        root = Path(normalize_ui_path(self.project_dir.get())).resolve()
         initial = build_default_output(root, self.add_timestamp.get())
         f = filedialog.asksaveasfilename(
             title="Choose output file",
@@ -291,52 +314,55 @@ class DumpItApp(tk.Tk):
             filetypes=[("Text file", "*.txt"), ("All files", "*.*")]
         )
         if f:
-            self.output_file.set(f)
+            self.output_file.set(normalize_ui_path(f))
 
     def _ensure_output_default(self) -> None:
         if not self.output_file.get().strip():
-            root = Path(self.project_dir.get()).resolve()
-            self.output_file.set(str(build_default_output(root, self.add_timestamp.get())))
+            root = Path(normalize_ui_path(self.project_dir.get())).resolve()
+            self.output_file.set(normalize_ui_path(str(build_default_output(root, self.add_timestamp.get()))))
 
     def _suggest_output_if_default(self) -> None:
         try:
-            root = Path(self.project_dir.get()).resolve()
+            root = Path(normalize_ui_path(self.project_dir.get())).resolve()
             current = self.output_file.get().strip()
             if not current:
-                self.output_file.set(str(build_default_output(root, self.add_timestamp.get())))
+                self.output_file.set(normalize_ui_path(str(build_default_output(root, self.add_timestamp.get()))))
                 return
             curp = Path(current).resolve()
             if curp.parent == root and curp.stem.startswith(root.name):
-                self.output_file.set(str(build_default_output(root, self.add_timestamp.get())))
+                self.output_file.set(normalize_ui_path(str(build_default_output(root, self.add_timestamp.get()))))
         except Exception:
             pass
 
     # ---------- Export ----------
     def _preview(self) -> None:
         try:
-            root = Path(self.project_dir.get()).resolve()
+            root = Path(normalize_ui_path(self.project_dir.get())).resolve()
             if not root.exists():
                 messagebox.showerror("Error", "Project folder does not exist.")
                 return
 
             patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
-            exclude = set(parse_csv_list(self.exclude_dirs.get()))
-            files = collect_files(root, exclude, patterns, self.skip_binary.get())
+            exclude = {x.lower() for x in parse_csv_list(self.exclude_dirs.get())}
+            out = normalize_ui_path(self.output_file.get().strip())
+            out_path = Path(out).resolve() if out else None
+            exclude_files = {canon_path(out_path)} if out_path else set()
+            files = collect_files(root, exclude, patterns, self.skip_binary.get(), exclude_files=exclude_files)
             self._log(f"Preview: {len(files)} files will be included from: {root}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
     def _export(self) -> None:
         try:
-            root = Path(self.project_dir.get()).resolve()
+            root = Path(normalize_ui_path(self.project_dir.get())).resolve()
             if not root.exists():
                 messagebox.showerror("Error", "Project folder does not exist.")
                 return
 
             patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
-            exclude = set(parse_csv_list(self.exclude_dirs.get()))
+            exclude = {x.lower() for x in parse_csv_list(self.exclude_dirs.get())}
 
-            out = self.output_file.get().strip()
+            out = normalize_ui_path(self.output_file.get().strip())
             out_path = Path(out).resolve() if out else build_default_output(root, self.add_timestamp.get())
 
             included, skipped = export_to_file(
@@ -441,6 +467,7 @@ class DumpItApp(tk.Tk):
 
         self._refresh_profile_combo()
         self._apply_profile_to_ui(self.profile_name.get())
+        self._active_profile = self.profile_name.get().strip() or "Default"
 
         self._log(f"Loaded config: {self.config_path}")
 
@@ -465,14 +492,23 @@ class DumpItApp(tk.Tk):
     def _on_profile_selected(self, _evt=None) -> None:
         if self._loading_ui:
             return
-        # salva profilo corrente prima di cambiare (auto-save)
-        self._save_config(silent=True)
 
-        name = self.profile_name.get().strip()
-        self._cp[SECTION_APP]["active_profile"] = name
-        self._apply_profile_to_ui(name)
+        # Nota: quando l'evento scatta, la Combobox ha già aggiornato self.profile_name
+        # ma la UI contiene ancora i valori del profilo precedente.
+        old = getattr(self, "_active_profile", "Default") or "Default"
+        new = self.profile_name.get().strip() or "Default"
+
+        # salva i valori della UI nel profilo *precedente* (non in quello appena selezionato)
+        self._write_ui_to_profile(old)
+
+        # passa al nuovo profilo
+        self._cp[SECTION_APP]["active_profile"] = new
+        self._apply_profile_to_ui(new)
+        self._active_profile = new
+
+        # persisti su disco (senza “sporcare” i profili)
         self._save_config(silent=True)
-        self._log(f"Switched profile: {name}")
+        self._log(f"Switched profile: {new}")
 
     def _profile_new(self) -> None:
         name = simpledialog.askstring("New profile", "Profile name:")
@@ -490,6 +526,7 @@ class DumpItApp(tk.Tk):
 
         self.profile_name.set(name)
         self._cp[SECTION_APP]["active_profile"] = name
+        self._active_profile = name
         self._refresh_profile_combo()
         self._apply_profile_to_ui(name)
         self._save_config(silent=True)
@@ -519,6 +556,7 @@ class DumpItApp(tk.Tk):
 
         self.profile_name.set(new)
         self._cp[SECTION_APP]["active_profile"] = new
+        self._active_profile = new
         self._refresh_profile_combo()
         self._save_config(silent=True)
         self._log(f"Renamed profile: {old} -> {new}")
@@ -544,6 +582,7 @@ class DumpItApp(tk.Tk):
         new_active = remaining[0] if remaining else "Default"
         self.profile_name.set(new_active)
         self._cp[SECTION_APP]["active_profile"] = new_active
+        self._active_profile = new_active
         self._refresh_profile_combo()
         self._apply_profile_to_ui(new_active)
         self._save_config(silent=True)
@@ -590,4 +629,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
