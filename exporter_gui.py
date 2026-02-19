@@ -381,29 +381,105 @@ class DumpItApp(tk.Tk):
             messagebox.showerror("Error", str(e))
 
     # ---------- Profiles / Config ----------
+    def _sec_ci(self, wanted: str) -> Optional[str]:
+        """Return the actual section name matching wanted (case-insensitive), if any."""
+        w = wanted.lower()
+        for sec in self._cp.sections():
+            if sec.lower() == w:
+                return sec
+        return None
+
+    def _normalize_config(self) -> None:
+        """Repair legacy configs: section name case, duplicated profile sections, etc."""
+        # Normalize APP section casing: 'App' -> 'app'
+        existing_app = self._sec_ci(SECTION_APP)
+        if existing_app and existing_app != SECTION_APP:
+            if SECTION_APP not in self._cp:
+                self._cp[SECTION_APP] = {}
+            # merge: canonical wins
+            for k, v in self._cp[existing_app].items():
+                if k not in self._cp[SECTION_APP]:
+                    self._cp[SECTION_APP][k] = v
+            self._cp.remove_section(existing_app)
+
+        # Deduplicate profile sections that differ only by case/prefix casing
+        groups: dict[str, list[str]] = {}
+        for sec in list(self._cp.sections()):
+            if sec.lower().startswith(PROFILE_PREFIX):
+                prof = sec[len(PROFILE_PREFIX):].strip()
+                key = prof.lower()
+                groups.setdefault(key, []).append(sec)
+
+        for _key, secs in groups.items():
+            if len(secs) <= 1:
+                continue
+            # prefer canonical prefix 'profile:' if present
+            primary = None
+            for s in secs:
+                if s.startswith(PROFILE_PREFIX):
+                    primary = s
+                    break
+            if primary is None:
+                primary = secs[0]
+
+            for s in secs:
+                if s == primary:
+                    continue
+                # merge: primary wins on conflicts
+                for k, v in self._cp[s].items():
+                    if k not in self._cp[primary]:
+                        self._cp[primary][k] = v
+                self._cp.remove_section(s)
+
     def _profile_section(self, name: str) -> str:
         return f"{PROFILE_PREFIX}{name}"
 
     def _get_profile_names(self) -> list[str]:
-        names: list[str] = []
+        # unique (case-insensitive), preserve first-seen casing
+        by_lower: dict[str, str] = {}
         for sec in self._cp.sections():
             if sec.lower().startswith(PROFILE_PREFIX):
-                names.append(sec[len(PROFILE_PREFIX):])
+                raw = sec[len(PROFILE_PREFIX):].strip()
+                if not raw:
+                    continue
+                key = raw.lower()
+                by_lower.setdefault(key, raw)
+        names = list(by_lower.values())
         names.sort(key=lambda x: x.lower())
         return names
 
-    def _refresh_profile_combo(self) -> None:
+    def _refresh_profile_combo(self, desired: Optional[str] = None) -> str:
+        """Refresh combobox values and ensure a valid selected profile.
+
+        Returns the selected (valid) profile name.
+        """
         names = self._get_profile_names()
         if not names:
             names = ["Default"]
         self.cb_profiles["values"] = names
-        cur = self.profile_name.get().strip()
+
+        cur = (desired if desired is not None else self.profile_name.get()).strip()
         if cur not in names:
-            self.profile_name.set(names[0])
+            cur = names[0]
+
+        # ensure displayed selection is consistent across platforms
+        self.profile_name.set(cur)
+        try:
+            self.cb_profiles.current(names.index(cur))
+        except Exception:
+            # fallback
+            self.cb_profiles.set(cur)
+        return cur
 
     def _ensure_minimum_config(self) -> None:
+        # app section may come from legacy casing; normalize_config() should fix, but be safe
         if SECTION_APP not in self._cp:
-            self._cp[SECTION_APP] = {}
+            alt = self._sec_ci(SECTION_APP)
+            if alt and alt in self._cp:
+                self._cp[SECTION_APP] = dict(self._cp[alt])
+                self._cp.remove_section(alt)
+            else:
+                self._cp[SECTION_APP] = {}
         if "active_profile" not in self._cp[SECTION_APP]:
             self._cp[SECTION_APP]["active_profile"] = "Default"
 
@@ -418,10 +494,12 @@ class DumpItApp(tk.Tk):
             }
 
     def _apply_profile_to_ui(self, name: str) -> None:
+        # section may exist with different casing
         sec = self._profile_section(name)
-        if sec not in self._cp:
+        sec_real = self._sec_ci(sec) or sec
+        if sec_real not in self._cp:
             # fallback: crea dal default
-            self._cp[sec] = {
+            self._cp[sec_real] = {
                 "include_patterns": DEFAULT_INCLUDE,
                 "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
                 "add_timestamp": "False",
@@ -429,7 +507,7 @@ class DumpItApp(tk.Tk):
                 "header_full_path": "False",
             }
 
-        s = self._cp[sec]
+        s = self._cp[sec_real]
         self._loading_ui = True
         try:
             self.include_patterns.set(s.get("include_patterns", DEFAULT_INCLUDE))
@@ -443,13 +521,14 @@ class DumpItApp(tk.Tk):
 
     def _write_ui_to_profile(self, name: str) -> None:
         sec = self._profile_section(name)
-        if sec not in self._cp:
-            self._cp[sec] = {}
-        self._cp[sec]["include_patterns"] = self.include_patterns.get()
-        self._cp[sec]["exclude_dirs"] = self.exclude_dirs.get()
-        self._cp[sec]["add_timestamp"] = str(self.add_timestamp.get())
-        self._cp[sec]["skip_binary"] = str(self.skip_binary.get())
-        self._cp[sec]["header_full_path"] = str(self.header_full_path.get())
+        sec_real = self._sec_ci(sec) or sec
+        if sec_real not in self._cp:
+            self._cp[sec_real] = {}
+        self._cp[sec_real]["include_patterns"] = self.include_patterns.get()
+        self._cp[sec_real]["exclude_dirs"] = self.exclude_dirs.get()
+        self._cp[sec_real]["add_timestamp"] = str(self.add_timestamp.get())
+        self._cp[sec_real]["skip_binary"] = str(self.skip_binary.get())
+        self._cp[sec_real]["header_full_path"] = str(self.header_full_path.get())
 
     def _load_config(self) -> None:
         # carica ini
@@ -459,15 +538,20 @@ class DumpItApp(tk.Tk):
             except Exception:
                 self._cp = configparser.ConfigParser()
 
+        # ripara config legacy (casing/duplicati)
+        self._normalize_config()
+
         self._ensure_minimum_config()
 
         # active profile
-        active = self._cp[SECTION_APP].get("active_profile", "Default")
-        self.profile_name.set(active)
+        active = (self._cp[SECTION_APP].get("active_profile", "Default") or "Default").strip()
 
-        self._refresh_profile_combo()
-        self._apply_profile_to_ui(self.profile_name.get())
-        self._active_profile = self.profile_name.get().strip() or "Default"
+        # refresh + ensure selection is valid, then apply
+        selected = self._refresh_profile_combo(desired=active)
+        self._apply_profile_to_ui(selected)
+        # failsafe: some Tk builds may render widgets after this point
+        self.after_idle(lambda s=selected: (not self._loading_ui) and self._apply_profile_to_ui(s))
+        self._active_profile = selected
 
         self._log(f"Loaded config: {self.config_path}")
 
@@ -493,22 +577,27 @@ class DumpItApp(tk.Tk):
         if self._loading_ui:
             return
 
-        # Nota: quando l'evento scatta, la Combobox ha già aggiornato self.profile_name
-        # ma la UI contiene ancora i valori del profilo precedente.
         old = getattr(self, "_active_profile", "Default") or "Default"
-        new = self.profile_name.get().strip() or "Default"
+        new = (self.profile_name.get() or "Default").strip() or "Default"
 
-        # salva i valori della UI nel profilo *precedente* (non in quello appena selezionato)
-        self._write_ui_to_profile(old)
+        # Applica in idle per evitare glitch di update su alcuni Tk/OS
+        def _do_switch() -> None:
+            if self._loading_ui:
+                return
 
-        # passa al nuovo profilo
-        self._cp[SECTION_APP]["active_profile"] = new
-        self._apply_profile_to_ui(new)
-        self._active_profile = new
+            # salva i valori della UI nel profilo *precedente* (non in quello appena selezionato)
+            self._write_ui_to_profile(old)
 
-        # persisti su disco (senza “sporcare” i profili)
-        self._save_config(silent=True)
-        self._log(f"Switched profile: {new}")
+            # passa al nuovo profilo
+            self._cp[SECTION_APP]["active_profile"] = new
+            self._apply_profile_to_ui(new)
+            self._active_profile = new
+
+            # persisti su disco
+            self._save_config(silent=True)
+            self._log(f"Switched profile: {new}")
+
+        self.after_idle(_do_switch)
 
     def _profile_new(self) -> None:
         name = simpledialog.askstring("New profile", "Profile name:")
@@ -516,13 +605,17 @@ class DumpItApp(tk.Tk):
         if not name:
             return
         sec = self._profile_section(name)
-        if sec in self._cp:
+        if (self._sec_ci(sec) or sec) in self._cp:
             messagebox.showerror("Error", f"Profile already exists: {name}")
             return
 
         # crea copiando i valori correnti (più comodo)
-        self._write_ui_to_profile(self.profile_name.get().strip() or "Default")
-        self._cp[sec] = dict(self._cp[self._profile_section(self.profile_name.get().strip() or "Default")])
+        base_name = self.profile_name.get().strip() or "Default"
+        self._write_ui_to_profile(base_name)
+        base_sec = self._sec_ci(self._profile_section(base_name)) or self._profile_section(base_name)
+        if base_sec not in self._cp:
+            self._cp[base_sec] = {}
+        self._cp[sec] = dict(self._cp[base_sec])
 
         self.profile_name.set(name)
         self._cp[SECTION_APP]["active_profile"] = name
@@ -541,10 +634,10 @@ class DumpItApp(tk.Tk):
         if not new or new == old:
             return
 
-        old_sec = self._profile_section(old)
+        old_sec = self._sec_ci(self._profile_section(old)) or self._profile_section(old)
         new_sec = self._profile_section(new)
 
-        if new_sec in self._cp:
+        if (self._sec_ci(new_sec) or new_sec) in self._cp:
             messagebox.showerror("Error", f"Profile already exists: {new}")
             return
         if old_sec not in self._cp:
@@ -573,7 +666,7 @@ class DumpItApp(tk.Tk):
         if not messagebox.askyesno("Delete profile", f"Delete profile '{name}'?"):
             return
 
-        sec = self._profile_section(name)
+        sec = self._sec_ci(self._profile_section(name)) or self._profile_section(name)
         if sec in self._cp:
             self._cp.remove_section(sec)
 
