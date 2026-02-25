@@ -209,7 +209,10 @@ class DumpItApp(tk.Tk):
 
         self._build_ui()
 
+        # During startup we prefer restoring batch selection from config (not from pre-populated UI)
+        self._loading_config = True
         self._load_config()
+        self._loading_config = False
         self._ensure_output_default()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -491,7 +494,7 @@ class DumpItApp(tk.Tk):
             self.cb_profiles.set(cur)
         # keep batch checklist in sync
         if hasattr(self, "batch_list_frame"):
-            self._refresh_batch_profile_list()
+            self._refresh_batch_profile_list(prefer_config=getattr(self, "_loading_config", False))
 
         return cur
 
@@ -625,11 +628,23 @@ class DumpItApp(tk.Tk):
         self.after_idle(lambda s=selected: (not self._loading_ui) and self._apply_profile_to_ui(s))
         self._active_profile = selected
 
+        # After loading config and profiles, rebuild batch list preferring saved selection
+        if hasattr(self, "batch_list_frame"):
+            try:
+                self._refresh_batch_profile_list(prefer_config=True)
+            except Exception:
+                pass
+
         self._log(f"Loaded config: {self.config_path}")
 
     def _save_config(self, silent: bool = False) -> None:
         try:
             self._ensure_minimum_config()
+            # keep batch selection in sync with config on any save
+            try:
+                self._store_batch_selection_to_config()
+            except Exception:
+                pass
             current = self.profile_name.get().strip() or "Default"
             self._write_ui_to_profile(current)
             self._cp[SECTION_APP]["active_profile"] = current
@@ -844,13 +859,14 @@ class DumpItApp(tk.Tk):
         # initial populate (real refresh happens after config load)
         self._refresh_batch_profile_list()
 
-    def _refresh_batch_profile_list(self) -> None:
+    def _refresh_batch_profile_list(self, prefer_config: bool = False) -> None:
         names = self._get_profile_names()
         if not names:
             names = ["Default"]
 
-        # preserve selection (case-insensitive)
-        old_sel = {k.lower(): v.get() for k, v in getattr(self, "batch_vars", {}).items()}
+        # preserve selection (case-insensitive). During startup we may want to ignore runtime UI state
+        # and prefer what was saved in config.
+        old_sel = {} if prefer_config else {k.lower(): v.get() for k, v in getattr(self, "batch_vars", {}).items()}
         # if no runtime selection yet, try load from config (only if previously saved)
         cfg_sel: Set[str] = set()
         has_cfg_sel = self._has_saved_batch_selection()
