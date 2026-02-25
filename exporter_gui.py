@@ -23,6 +23,7 @@ DEFAULT_EXCLUDE_DIRS = ".git,.vscode,.alpackages,bin,obj,node_modules,.idea,.vs,
 
 SECTION_APP = "app"
 PROFILE_PREFIX = "profile:"  # es: profile:Default
+APP_BATCH_SELECTED_KEY = "batch_selected_profiles"  # csv list of profile names
 
 
 def get_default_project_dir() -> Path:
@@ -518,6 +519,38 @@ class DumpItApp(tk.Tk):
                 "header_full_path": "False",
             }
 
+    # ---------- Batch selection persistence ----------
+    def _has_saved_batch_selection(self) -> bool:
+        try:
+            return self._cp.has_option(SECTION_APP, APP_BATCH_SELECTED_KEY)
+        except Exception:
+            return False
+
+    def _get_batch_selection_from_config(self) -> Set[str]:
+        try:
+            raw = self._cp.get(SECTION_APP, APP_BATCH_SELECTED_KEY, fallback="") or ""
+        except Exception:
+            raw = ""
+        return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+    def _store_batch_selection_to_config(self) -> None:
+        # Only touch the app section; do NOT auto-save profiles here.
+        if SECTION_APP not in self._cp:
+            self._cp[SECTION_APP] = {}
+        sel = self._get_selected_batch_profiles()
+        self._cp[SECTION_APP][APP_BATCH_SELECTED_KEY] = ",".join(sel)
+
+    def _on_batch_selection_changed(self) -> None:
+        # Persist selection for next run (written to disk on close/export/save)
+        self._store_batch_selection_to_config()
+        if hasattr(self, "lbl_batch_status"):
+            try:
+                total = len(self._get_profile_names())
+                sel = len(self._get_selected_batch_profiles())
+                self.lbl_batch_status.configure(text=f"{total} profiles — selected {sel}")
+            except Exception:
+                pass
+
     def _apply_profile_to_ui(self, name: str) -> None:
         # section may exist with different casing
         sec = self._profile_section(name)
@@ -732,6 +765,11 @@ class DumpItApp(tk.Tk):
         self._log("Reset to defaults (not saved yet).")
 
     def _on_close(self) -> None:
+        # persist batch selection
+        try:
+            self._store_batch_selection_to_config()
+        except Exception:
+            pass
         self._save_config(silent=True)
         self.destroy()
 
@@ -813,6 +851,11 @@ class DumpItApp(tk.Tk):
 
         # preserve selection (case-insensitive)
         old_sel = {k.lower(): v.get() for k, v in getattr(self, "batch_vars", {}).items()}
+        # if no runtime selection yet, try load from config (only if previously saved)
+        cfg_sel: Set[str] = set()
+        has_cfg_sel = self._has_saved_batch_selection()
+        if not old_sel and has_cfg_sel:
+            cfg_sel = self._get_batch_selection_from_config()
 
         # clear UI
         if hasattr(self, "batch_list_frame"):
@@ -824,23 +867,28 @@ class DumpItApp(tk.Tk):
         active = (self._cp.get(SECTION_APP, "active_profile", fallback="Default") or "Default").strip()
 
         for name in names:
-            var = tk.BooleanVar(value=old_sel.get(name.lower(), False))
+            initial = old_sel.get(name.lower(), (name.lower() in cfg_sel) if has_cfg_sel else False)
+            var = tk.BooleanVar(value=initial)
             self.batch_vars[name] = var
             any_checked = any_checked or var.get()
 
-            cb = ttk.Checkbutton(self.batch_list_frame, text=name, variable=var)
+            cb = ttk.Checkbutton(self.batch_list_frame, text=name, variable=var, command=self._on_batch_selection_changed)
             cb.pack(anchor="w", padx=6, pady=2)
 
-        # if nothing selected, default to active profile
-        if names and not any_checked:
+        # if nothing selected and there was NO saved selection, default to active profile
+        if names and not any_checked and not has_cfg_sel:
             for n in names:
                 if n.lower() == active.lower():
                     self.batch_vars[n].set(True)
+                    any_checked = True
                     break
+
+        # keep config in sync with what's shown
+        self._store_batch_selection_to_config()
 
         # status line
         if hasattr(self, "lbl_batch_status"):
-            self.lbl_batch_status.configure(text=f"{len(names)} profiles")
+            self.lbl_batch_status.configure(text=f"{len(names)} profiles — selected {len(self._get_selected_batch_profiles())}")
 
         # refresh scrollregion
         if hasattr(self, "batch_canvas"):
@@ -852,10 +900,12 @@ class DumpItApp(tk.Tk):
     def _batch_select_all(self) -> None:
         for v in getattr(self, "batch_vars", {}).values():
             v.set(True)
+        self._on_batch_selection_changed()
 
     def _batch_select_none(self) -> None:
         for v in getattr(self, "batch_vars", {}).values():
             v.set(False)
+        self._on_batch_selection_changed()
 
     def _get_selected_batch_profiles(self) -> list[str]:
         out: list[str] = []
@@ -900,6 +950,9 @@ class DumpItApp(tk.Tk):
         if not selected:
             messagebox.showerror("Batch", "Select at least one profile.")
             return
+
+        # Remember current batch selection for next run
+        self._store_batch_selection_to_config()
 
         # Persist the current profile silently (so batch sees latest saved state for it)
         self._save_config(silent=True)
