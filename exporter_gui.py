@@ -219,8 +219,21 @@ class DumpItApp(tk.Tk):
         root = ttk.Frame(self)
         root.pack(fill="both", expand=True, **pad)
 
+        # Tabs
+        self.nb = ttk.Notebook(root)
+        self.nb.pack(fill="both", expand=True, **pad)
+
+        self.tab_export = ttk.Frame(self.nb)
+        self.tab_batch = ttk.Frame(self.nb)
+
+        self.nb.add(self.tab_export, text="Export")
+        self.nb.add(self.tab_batch, text="Batch")
+
+        # ---------- EXPORT TAB ----------
+        export_root = self.tab_export
+
         # Profiles frame
-        lf0 = ttk.LabelFrame(root, text="Profile")
+        lf0 = ttk.LabelFrame(export_root, text="Profile")
         lf0.pack(fill="x", **pad)
         row0 = ttk.Frame(lf0)
         row0.pack(fill="x", padx=8, pady=8)
@@ -241,29 +254,29 @@ class DumpItApp(tk.Tk):
         ttk.Button(row0_actions, text="Save profile", command=self._save_config).pack(side="right", padx=4)
 
         # Project folder
-        lf1 = ttk.LabelFrame(root, text="Project folder")
+        lf1 = ttk.LabelFrame(export_root, text="Project folder")
         lf1.pack(fill="x", **pad)
         ttk.Entry(lf1, textvariable=self.project_dir).pack(side="left", fill="x", expand=True, padx=8, pady=8)
         ttk.Button(lf1, text="Browse…", command=self._browse_project).pack(side="left", padx=8, pady=8)
 
         # Include patterns
-        lf2 = ttk.LabelFrame(root, text="Include patterns (comma-separated, ex: *.al,app.json,*.gd)")
+        lf2 = ttk.LabelFrame(export_root, text="Include patterns (comma-separated, ex: *.al,app.json,*.gd)")
         lf2.pack(fill="x", **pad)
         ttk.Entry(lf2, textvariable=self.include_patterns).pack(fill="x", padx=8, pady=8)
 
         # Exclude dirs
-        lf3 = ttk.LabelFrame(root, text="Exclude folders (comma-separated, match by folder name)")
+        lf3 = ttk.LabelFrame(export_root, text="Exclude folders (comma-separated, match by folder name)")
         lf3.pack(fill="x", **pad)
         ttk.Entry(lf3, textvariable=self.exclude_dirs).pack(fill="x", padx=8, pady=8)
 
         # Output
-        lf4 = ttk.LabelFrame(root, text="Output file")
+        lf4 = ttk.LabelFrame(export_root, text="Output file")
         lf4.pack(fill="x", **pad)
         ttk.Entry(lf4, textvariable=self.output_file).pack(side="left", fill="x", expand=True, padx=8, pady=8)
         ttk.Button(lf4, text="Choose…", command=self._choose_output).pack(side="left", padx=8, pady=8)
 
         # Options
-        lf5 = ttk.LabelFrame(root, text="Options")
+        lf5 = ttk.LabelFrame(export_root, text="Options")
         lf5.pack(fill="x", **pad)
         opt = ttk.Frame(lf5)
         opt.pack(fill="x", padx=8, pady=8)
@@ -278,12 +291,15 @@ class DumpItApp(tk.Tk):
         )
 
         # Actions
-        actions = ttk.Frame(root)
+        actions = ttk.Frame(export_root)
         actions.pack(fill="x", **pad)
         ttk.Button(actions, text="Preview", command=self._preview).pack(side="left", padx=4)
         ttk.Button(actions, text="Export", command=self._export).pack(side="left", padx=4)
 
-        # Log
+        # ---------- BATCH TAB ----------
+        self._build_batch_tab(self.tab_batch, pad)
+
+        # ---------- SHARED LOG ----------
         self.log = tk.Text(root, height=10, wrap="word")
         self.log.pack(fill="both", expand=True, **pad)
         self.log.configure(state="disabled")
@@ -293,7 +309,6 @@ class DumpItApp(tk.Tk):
         footer.pack(fill="x", **pad)
         self.lbl_cfg = ttk.Label(footer, text=f"Config: {self.config_path}")
         self.lbl_cfg.pack(side="left")
-
     def _log(self, msg: str) -> None:
         self.log.configure(state="normal")
         self.log.insert("end", msg + "\n")
@@ -473,6 +488,10 @@ class DumpItApp(tk.Tk):
         except Exception:
             # fallback
             self.cb_profiles.set(cur)
+        # keep batch checklist in sync
+        if hasattr(self, "batch_list_frame"):
+            self._refresh_batch_profile_list()
+
         return cur
 
     def _ensure_minimum_config(self) -> None:
@@ -715,6 +734,229 @@ class DumpItApp(tk.Tk):
     def _on_close(self) -> None:
         self._save_config(silent=True)
         self.destroy()
+
+
+    # ---------- Batch UI / Runner ----------
+    def _build_batch_tab(self, parent: ttk.Frame, pad: dict) -> None:
+        info = ttk.LabelFrame(parent, text="Batch")
+        info.pack(fill="both", expand=True, **pad)
+
+        top = ttk.Frame(info)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+
+        ttk.Label(
+            top,
+            text="Select one or more profiles to run. (Batch uses the saved profile settings — click 'Save profile' if needed.)",
+            wraplength=760,
+            justify="left",
+        ).pack(side="left", fill="x", expand=True)
+
+        tools = ttk.Frame(info)
+        tools.pack(fill="x", padx=8, pady=(0, 6))
+
+        ttk.Button(tools, text="Select all", command=self._batch_select_all).pack(side="left", padx=4)
+        ttk.Button(tools, text="Select none", command=self._batch_select_none).pack(side="left", padx=4)
+
+        self.lbl_batch_status = ttk.Label(tools, text="")
+        self.lbl_batch_status.pack(side="right")
+
+        # Scrollable checklist
+        container = ttk.Frame(info)
+        container.pack(fill="both", expand=True, padx=8, pady=6)
+
+        self.batch_canvas = tk.Canvas(container, highlightthickness=0)
+        self.batch_scroll = ttk.Scrollbar(container, orient="vertical", command=self.batch_canvas.yview)
+        self.batch_canvas.configure(yscrollcommand=self.batch_scroll.set)
+
+        self.batch_scroll.pack(side="right", fill="y")
+        self.batch_canvas.pack(side="left", fill="both", expand=True)
+
+        self.batch_list_frame = ttk.Frame(self.batch_canvas)
+        self.batch_canvas_window = self.batch_canvas.create_window((0, 0), window=self.batch_list_frame, anchor="nw")
+
+        def _on_frame_configure(_evt=None):
+            self.batch_canvas.configure(scrollregion=self.batch_canvas.bbox("all"))
+
+        def _on_canvas_configure(evt):
+            # make inner frame width follow canvas width
+            try:
+                self.batch_canvas.itemconfig(self.batch_canvas_window, width=evt.width)
+            except Exception:
+                pass
+
+        self.batch_list_frame.bind("<Configure>", _on_frame_configure)
+        self.batch_canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Run buttons
+        run = ttk.Frame(info)
+        run.pack(fill="x", padx=8, pady=(0, 10))
+
+        self.btn_batch_preview = ttk.Button(run, text="Run batch preview", command=lambda: self._run_batch("preview"))
+        self.btn_batch_preview.pack(side="left", padx=4)
+
+        self.btn_batch_export = ttk.Button(run, text="Run batch export", command=lambda: self._run_batch("export"))
+        self.btn_batch_export.pack(side="left", padx=4)
+
+        # Runtime state
+        self.batch_vars: dict[str, tk.BooleanVar] = {}
+        self._batch_queue: list[str] = []
+        self._batch_mode: str = ""
+        self._batch_results: list[tuple[str, str]] = []
+
+        # initial populate (real refresh happens after config load)
+        self._refresh_batch_profile_list()
+
+    def _refresh_batch_profile_list(self) -> None:
+        names = self._get_profile_names()
+        if not names:
+            names = ["Default"]
+
+        # preserve selection (case-insensitive)
+        old_sel = {k.lower(): v.get() for k, v in getattr(self, "batch_vars", {}).items()}
+
+        # clear UI
+        if hasattr(self, "batch_list_frame"):
+            for w in self.batch_list_frame.winfo_children():
+                w.destroy()
+
+        self.batch_vars = {}
+        any_checked = False
+        active = (self._cp.get(SECTION_APP, "active_profile", fallback="Default") or "Default").strip()
+
+        for name in names:
+            var = tk.BooleanVar(value=old_sel.get(name.lower(), False))
+            self.batch_vars[name] = var
+            any_checked = any_checked or var.get()
+
+            cb = ttk.Checkbutton(self.batch_list_frame, text=name, variable=var)
+            cb.pack(anchor="w", padx=6, pady=2)
+
+        # if nothing selected, default to active profile
+        if names and not any_checked:
+            for n in names:
+                if n.lower() == active.lower():
+                    self.batch_vars[n].set(True)
+                    break
+
+        # status line
+        if hasattr(self, "lbl_batch_status"):
+            self.lbl_batch_status.configure(text=f"{len(names)} profiles")
+
+        # refresh scrollregion
+        if hasattr(self, "batch_canvas"):
+            try:
+                self.batch_canvas.configure(scrollregion=self.batch_canvas.bbox("all"))
+            except Exception:
+                pass
+
+    def _batch_select_all(self) -> None:
+        for v in getattr(self, "batch_vars", {}).values():
+            v.set(True)
+
+    def _batch_select_none(self) -> None:
+        for v in getattr(self, "batch_vars", {}).values():
+            v.set(False)
+
+    def _get_selected_batch_profiles(self) -> list[str]:
+        out: list[str] = []
+        for name, var in getattr(self, "batch_vars", {}).items():
+            if var.get():
+                out.append(name)
+        out.sort(key=lambda x: x.lower())
+        return out
+
+    def _read_profile_settings(self, name: str):
+        sec = self._profile_section(name)
+        sec_real = self._sec_ci(sec) or sec
+        if sec_real not in self._cp:
+            raise ValueError(f"Profile not found: {name}")
+
+        s = self._cp[sec_real]
+
+        project_dir = normalize_ui_path(s.get("project_dir", str(get_default_project_dir())))
+        root = Path(project_dir).resolve()
+
+        include_patterns = normalize_patterns(parse_csv_list(s.get("include_patterns", DEFAULT_INCLUDE)))
+        exclude_dirs = {x.lower() for x in parse_csv_list(s.get("exclude_dirs", DEFAULT_EXCLUDE_DIRS))}
+
+        add_timestamp = s.getboolean("add_timestamp", fallback=False)
+        skip_binary = s.getboolean("skip_binary", fallback=True)
+        header_full_path = s.getboolean("header_full_path", fallback=False)
+
+        out_str = normalize_ui_path(s.get("output_file", "").strip())
+        out_path = Path(out_str).resolve() if out_str else build_default_output(root, add_timestamp)
+
+        return root, out_path, include_patterns, exclude_dirs, skip_binary, header_full_path
+
+    def _set_batch_running(self, running: bool) -> None:
+        try:
+            self.btn_batch_preview.configure(state=("disabled" if running else "normal"))
+            self.btn_batch_export.configure(state=("disabled" if running else "normal"))
+        except Exception:
+            pass
+
+    def _run_batch(self, mode: str) -> None:
+        selected = self._get_selected_batch_profiles()
+        if not selected:
+            messagebox.showerror("Batch", "Select at least one profile.")
+            return
+
+        # Persist the current profile silently (so batch sees latest saved state for it)
+        self._save_config(silent=True)
+
+        self._batch_queue = list(selected)
+        self._batch_mode = mode
+        self._batch_results = []
+        self._set_batch_running(True)
+        self.lbl_batch_status.configure(text=f"Running {mode}: 0/{len(self._batch_queue)}")
+        self._log(f"Batch start ({mode}): {', '.join(selected)}")
+
+        self.after(10, self._batch_step)
+
+    def _batch_step(self) -> None:
+        total = len(self._batch_queue) + len(self._batch_results)
+
+        if not self._batch_queue:
+            # done
+            ok = sum(1 for _, status in self._batch_results if status == "OK")
+            err = sum(1 for _, status in self._batch_results if status != "OK")
+            self._set_batch_running(False)
+            self.lbl_batch_status.configure(text=f"Done: OK {ok}, Errors {err}")
+            self._log(f"Batch done: OK {ok}, Errors {err}")
+            messagebox.showinfo("Batch done", f"Completed.\nOK: {ok}\nErrors: {err}")
+            return
+
+        name = self._batch_queue.pop(0)
+        done = len(self._batch_results) + 1
+        self.lbl_batch_status.configure(text=f"Running {self._batch_mode}: {done}/{done + len(self._batch_queue)}")
+
+        try:
+            root, out_path, patterns, exclude_dirs, skip_binary, header_full_path = self._read_profile_settings(name)
+            if not root.exists():
+                raise FileNotFoundError(f"Project folder does not exist: {root}")
+
+            if self._batch_mode == "preview":
+                exclude_files = {canon_path(out_path)}
+                files = collect_files(root, exclude_dirs, patterns, skip_binary, exclude_files=exclude_files)
+                self._log(f"[{name}] Preview: {len(files)} files from: {root}")
+            else:
+                included, skipped = export_to_file(
+                    root=root,
+                    out_path=out_path,
+                    exclude_dirs=exclude_dirs,
+                    patterns=patterns,
+                    skip_binary=skip_binary,
+                    header_full_path=header_full_path,
+                )
+                self._log(f"[{name}] OK: exported {included} files -> {out_path} (skipped read errors: {skipped})")
+
+            self._batch_results.append((name, "OK"))
+        except Exception as e:
+            self._batch_results.append((name, "ERR"))
+            self._log(f"[{name}] ERROR: {e}")
+
+        # keep UI responsive
+        self.after(10, self._batch_step)
 
 
 def _crash_log_path() -> Path:
