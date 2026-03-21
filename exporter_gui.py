@@ -8,6 +8,7 @@ import sys
 import platform
 import fnmatch
 import configparser
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
@@ -943,9 +944,21 @@ class DumpItApp(tk.Tk):
         out_path = Path(out).resolve() if out else build_default_output(root, self.add_timestamp.get())
         return root, out_path, patterns, exclude_dirs, self.skip_binary.get(), self.header_full_path.get()
 
-    def _build_watch_snapshot(self) -> dict[str, tuple[int, int]]:
+    def _file_digest(self, p: Path) -> str:
+        h = hashlib.sha1()
+        with p.open("rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    
+    
+    def _build_watch_snapshot(self) -> dict[str, tuple[int, int, str]]:
         if self._watch_root is None or self._watch_out_path is None:
             return {}
+    
         exclude_files = {canon_path(self._watch_out_path)}
         files = collect_files(
             self._watch_root,
@@ -954,26 +967,31 @@ class DumpItApp(tk.Tk):
             self._watch_skip_binary,
             exclude_files=exclude_files,
         )
-        snapshot: dict[str, tuple[int, int]] = {}
+    
+        snapshot: dict[str, tuple[int, int, str]] = {}
         for p in files:
             try:
                 st = p.stat()
+                digest = self._file_digest(p)
             except OSError:
                 continue
-            snapshot[canon_path(p)] = (st.st_mtime_ns, st.st_size)
+            snapshot[canon_path(p)] = (st.st_mtime_ns, st.st_size, digest)
+    
         return snapshot
 
     def _summarize_snapshot_changes(
         self,
-        old_snapshot: dict[str, tuple[int, int]],
-        new_snapshot: dict[str, tuple[int, int]],
+        old_snapshot: dict[str, tuple[int, int, str]],
+        new_snapshot: dict[str, tuple[int, int, str]],
     ) -> tuple[int, int, int]:
         added = len(set(new_snapshot) - set(old_snapshot))
         removed = len(set(old_snapshot) - set(new_snapshot))
         modified = 0
+    
         for key in set(old_snapshot).intersection(new_snapshot):
             if old_snapshot[key] != new_snapshot[key]:
                 modified += 1
+    
         return added, modified, removed
 
     def _schedule_watch_tick(self) -> None:
