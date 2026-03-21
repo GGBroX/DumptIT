@@ -8,6 +8,7 @@ import sys
 import platform
 import fnmatch
 import configparser
+import hashlib
 from pathlib import Path
 from datetime import datetime
 
@@ -209,6 +210,29 @@ class DumpItApp(tk.Tk):
         self.config_path = get_config_path()
         self._active_profile = "Default"
 
+        # Watch settings (per profile)
+        self.watch_poll_ms = tk.StringVar(value="1500")
+        self.watch_quiet_ms = tk.StringVar(value="1200")
+        self.watch_export_on_start = tk.BooleanVar(value=True)
+
+        # Watch runtime state
+        self._watch_running = False
+        self._watch_after_id: str | None = None
+        self._watch_pending_export_id: str | None = None
+        self._watch_export_in_progress = False
+        self._watch_profile_name = ""
+        self._watch_snapshot: dict[str, tuple[int, int]] = {}
+        self._watch_root: Path | None = None
+        self._watch_out_path: Path | None = None
+        self._watch_patterns: list[str] = []
+        self._watch_exclude_dirs: set[str] = set()
+        self._watch_skip_binary = True
+        self._watch_header_full_path = False
+        self._watch_poll_interval_ms = 1500
+        self._watch_quiet_period_ms = 1200
+        self._watch_last_change_summary = "No changes detected yet."
+        self._watch_last_export_summary = "No automatic export yet."
+
         self._build_ui()
 
         self._loading_config = True
@@ -249,9 +273,11 @@ class DumpItApp(tk.Tk):
         self.nb.pack(fill="both", expand=True, **pad)
 
         self.tab_export = ttk.Frame(self.nb)
+        self.tab_watch = ttk.Frame(self.nb)
         self.tab_batch = ttk.Frame(self.nb)
 
         self.nb.add(self.tab_export, text="Export")
+        self.nb.add(self.tab_watch, text="Watch")
         self.nb.add(self.tab_batch, text="Batch")
 
         # ---------- EXPORT TAB ----------
@@ -321,6 +347,9 @@ class DumpItApp(tk.Tk):
         ttk.Button(actions, text="Preview", command=self._preview).pack(side="left", padx=4)
         ttk.Button(actions, text="Export", command=self._export).pack(side="left", padx=4)
 
+        # ---------- WATCH TAB ----------
+        self._build_watch_tab(self.tab_watch, pad)
+
         # ---------- BATCH TAB ----------
         self._build_batch_tab(self.tab_batch, pad)
 
@@ -334,6 +363,9 @@ class DumpItApp(tk.Tk):
         footer.pack(fill="x", **pad)
         self.lbl_cfg = ttk.Label(footer, text=f"Config: {self.config_path}")
         self.lbl_cfg.pack(side="left")
+
+        self._set_watch_status("Stopped")
+
     def _log(self, msg: str) -> None:
         self.log.configure(state="normal")
         self.log.insert("end", msg + "\n")
@@ -541,6 +573,9 @@ class DumpItApp(tk.Tk):
                 "add_timestamp": "False",
                 "skip_binary": "True",
                 "header_full_path": "False",
+                "watch_poll_ms": "1500",
+                "watch_quiet_ms": "1200",
+                "watch_export_on_start": "True",
             }
 
     # ---------- Batch selection persistence ----------
@@ -589,6 +624,9 @@ class DumpItApp(tk.Tk):
                 "add_timestamp": "False",
                 "skip_binary": "True",
                 "header_full_path": "False",
+                "watch_poll_ms": "1500",
+                "watch_quiet_ms": "1200",
+                "watch_export_on_start": "True",
             }
 
         s = self._cp[sec_real]
@@ -604,6 +642,9 @@ class DumpItApp(tk.Tk):
             self.header_full_path.set(s.getboolean("header_full_path", fallback=False))
 
             self.output_file.set(normalize_ui_path(s.get("output_file", "")))
+            self.watch_poll_ms.set(s.get("watch_poll_ms", "1500"))
+            self.watch_quiet_ms.set(s.get("watch_quiet_ms", "1200"))
+            self.watch_export_on_start.set(s.getboolean("watch_export_on_start", fallback=True))
 
             # Se il profilo non ha output_file, calcolane uno di default per quella project_dir
             self._ensure_output_default()
@@ -625,6 +666,9 @@ class DumpItApp(tk.Tk):
         self._cp[sec_real]["add_timestamp"] = str(self.add_timestamp.get())
         self._cp[sec_real]["skip_binary"] = str(self.skip_binary.get())
         self._cp[sec_real]["header_full_path"] = str(self.header_full_path.get())
+        self._cp[sec_real]["watch_poll_ms"] = self.watch_poll_ms.get().strip()
+        self._cp[sec_real]["watch_quiet_ms"] = self.watch_quiet_ms.get().strip()
+        self._cp[sec_real]["watch_export_on_start"] = str(self.watch_export_on_start.get())
 
     def _load_config(self) -> None:
         # carica ini
@@ -797,10 +841,14 @@ class DumpItApp(tk.Tk):
         self.skip_binary.set(True)
         self.header_full_path.set(False)
         self.output_file.set("")
+        self.watch_poll_ms.set("1500")
+        self.watch_quiet_ms.set("1200")
+        self.watch_export_on_start.set(True)
         self._ensure_output_default()
         self._log("Reset to defaults (not saved yet).")
 
     def _on_close(self) -> None:
+        self._watch_stop(log=False)
         # persist batch selection
         try:
             self._store_batch_selection_to_config()
@@ -808,6 +856,324 @@ class DumpItApp(tk.Tk):
             pass
         self._save_config(silent=True)
         self.destroy()
+
+
+    def _build_watch_tab(self, parent: ttk.Frame, pad: dict) -> None:
+        info = ttk.LabelFrame(parent, text="Continuous watch")
+        info.pack(fill="both", expand=True, **pad)
+
+        desc = ttk.Label(
+            info,
+            text=(
+                "Select a profile in Export, then start monitoring. DumpIt watches matching files "
+                "for that profile and automatically re-exports after a short quiet period."
+            ),
+            wraplength=760,
+            justify="left",
+        )
+        desc.pack(fill="x", padx=8, pady=(8, 4))
+
+        status = ttk.Frame(info)
+        status.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Label(status, text="Status:").pack(side="left")
+        self.lbl_watch_status = ttk.Label(status, text="Stopped")
+        self.lbl_watch_status.pack(side="left", padx=(6, 16))
+        ttk.Label(status, text="Profile locked at start:").pack(side="left")
+        self.lbl_watch_profile = ttk.Label(status, text="—")
+        self.lbl_watch_profile.pack(side="left", padx=(6, 0))
+
+        opts = ttk.LabelFrame(info, text="Watch options")
+        opts.pack(fill="x", padx=8, pady=6)
+        grid = ttk.Frame(opts)
+        grid.pack(fill="x", padx=8, pady=8)
+
+        ttk.Label(grid, text="Poll interval (ms)").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(grid, textvariable=self.watch_poll_ms, width=12).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(grid, text="Quiet time before export (ms)").grid(row=0, column=2, sticky="w", padx=6, pady=4)
+        ttk.Entry(grid, textvariable=self.watch_quiet_ms, width=12).grid(row=0, column=3, sticky="w", padx=6, pady=4)
+
+        ttk.Checkbutton(
+            grid,
+            text="Run one export immediately on Start",
+            variable=self.watch_export_on_start,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=6, pady=4)
+
+        actions = ttk.Frame(info)
+        actions.pack(fill="x", padx=8, pady=6)
+        self.btn_watch_start = ttk.Button(actions, text="Start monitoring", command=self._watch_start)
+        self.btn_watch_start.pack(side="left", padx=4)
+        self.btn_watch_stop = ttk.Button(actions, text="Stop", command=self._watch_stop, state="disabled")
+        self.btn_watch_stop.pack(side="left", padx=4)
+        ttk.Button(actions, text="Export now", command=lambda: self._run_export(show_message=True)).pack(side="left", padx=12)
+
+        details = ttk.LabelFrame(info, text="Activity")
+        details.pack(fill="both", expand=True, padx=8, pady=(6, 10))
+
+        self.lbl_watch_last_change = ttk.Label(details, text="No changes detected yet.", wraplength=760, justify="left")
+        self.lbl_watch_last_change.pack(fill="x", padx=8, pady=(8, 4))
+
+        self.lbl_watch_last_export = ttk.Label(details, text="No automatic export yet.", wraplength=760, justify="left")
+        self.lbl_watch_last_export.pack(fill="x", padx=8, pady=(0, 8))
+
+    def _set_watch_status(self, text: str) -> None:
+        self.lbl_watch_status.configure(text=text)
+        self.lbl_watch_profile.configure(text=(self._watch_profile_name or "—"))
+        self.lbl_watch_last_change.configure(text=self._watch_last_change_summary)
+        self.lbl_watch_last_export.configure(text=self._watch_last_export_summary)
+        self.btn_watch_start.configure(state=("disabled" if self._watch_running else "normal"))
+        self.btn_watch_stop.configure(state=("normal" if self._watch_running else "disabled"))
+
+    def _watch_validate_ms(self, value: str, label: str, fallback: int, minimum: int = 100) -> int:
+        raw = (value or "").strip()
+        try:
+            parsed = int(raw)
+        except ValueError:
+            raise ValueError(f"{label} must be an integer.")
+        if parsed < minimum:
+            raise ValueError(f"{label} must be at least {minimum} ms.")
+        return parsed
+
+    def _get_current_ui_export_settings(self) -> tuple[Path, Path, list[str], set[str], bool, bool]:
+        root = Path(normalize_ui_path(self.project_dir.get())).resolve()
+        if not root.exists():
+            raise FileNotFoundError("Project folder does not exist.")
+
+        patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
+        exclude_dirs = {x.lower() for x in parse_csv_list(self.exclude_dirs.get())}
+        out = normalize_ui_path(self.output_file.get().strip())
+        out_path = Path(out).resolve() if out else build_default_output(root, self.add_timestamp.get())
+        return root, out_path, patterns, exclude_dirs, self.skip_binary.get(), self.header_full_path.get()
+
+    def _file_digest(self, p: Path) -> str:
+        h = hashlib.sha1()
+        with p.open("rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    
+    
+    def _build_watch_snapshot(self) -> dict[str, tuple[int, int, str]]:
+        if self._watch_root is None or self._watch_out_path is None:
+            return {}
+    
+        exclude_files = {canon_path(self._watch_out_path)}
+        files = collect_files(
+            self._watch_root,
+            self._watch_exclude_dirs,
+            self._watch_patterns,
+            self._watch_skip_binary,
+            exclude_files=exclude_files,
+        )
+    
+        snapshot: dict[str, tuple[int, int, str]] = {}
+        for p in files:
+            try:
+                st = p.stat()
+                digest = self._file_digest(p)
+            except OSError:
+                continue
+            snapshot[canon_path(p)] = (st.st_mtime_ns, st.st_size, digest)
+    
+        return snapshot
+
+    def _summarize_snapshot_changes(
+        self,
+        old_snapshot: dict[str, tuple[int, int, str]],
+        new_snapshot: dict[str, tuple[int, int, str]],
+    ) -> tuple[int, int, int]:
+        added = len(set(new_snapshot) - set(old_snapshot))
+        removed = len(set(old_snapshot) - set(new_snapshot))
+        modified = 0
+    
+        for key in set(old_snapshot).intersection(new_snapshot):
+            if old_snapshot[key] != new_snapshot[key]:
+                modified += 1
+    
+        return added, modified, removed
+
+    def _schedule_watch_tick(self) -> None:
+        if not self._watch_running:
+            return
+        self._watch_after_id = self.after(self._watch_poll_interval_ms, self._watch_tick)
+
+    def _schedule_watch_export(self) -> None:
+        if not self._watch_running:
+            return
+        if self._watch_pending_export_id:
+            try:
+                self.after_cancel(self._watch_pending_export_id)
+            except Exception:
+                pass
+        self._watch_pending_export_id = self.after(self._watch_quiet_period_ms, self._watch_export_now)
+
+    def _watch_start(self) -> None:
+        if self._watch_running:
+            return
+        try:
+            poll_ms = self._watch_validate_ms(self.watch_poll_ms.get(), "Poll interval", 1500)
+            quiet_ms = self._watch_validate_ms(self.watch_quiet_ms.get(), "Quiet time before export", 1200)
+            root, out_path, patterns, exclude_dirs, skip_binary, header_full_path = self._get_current_ui_export_settings()
+        except Exception as e:
+            messagebox.showerror("Watch", str(e))
+            return
+
+        self.watch_poll_ms.set(str(poll_ms))
+        self.watch_quiet_ms.set(str(quiet_ms))
+        self._save_config(silent=True)
+
+        self._watch_running = True
+        self._watch_profile_name = (self.profile_name.get().strip() or "Default")
+        self._watch_root = root
+        self._watch_out_path = out_path
+        self._watch_patterns = list(patterns)
+        self._watch_exclude_dirs = set(exclude_dirs)
+        self._watch_skip_binary = skip_binary
+        self._watch_header_full_path = header_full_path
+        self._watch_poll_interval_ms = poll_ms
+        self._watch_quiet_period_ms = quiet_ms
+        self._watch_snapshot = self._build_watch_snapshot()
+        self._watch_last_change_summary = f"Monitoring {len(self._watch_snapshot)} matching files under: {root}"
+        self._watch_last_export_summary = "No automatic export yet."
+        self._set_watch_status("Monitoring")
+        self._log(
+            f"Watch started for profile '{self._watch_profile_name}' "
+            f"(poll {poll_ms} ms, quiet {quiet_ms} ms, files {len(self._watch_snapshot)})"
+        )
+
+        if self.watch_export_on_start.get():
+            self._watch_last_export_summary = "Automatic export requested at start..."
+            self._set_watch_status("Exporting")
+            self.after(10, self._watch_export_now)
+        else:
+            self._schedule_watch_tick()
+
+    def _watch_stop(self, log: bool = True) -> None:
+        if self._watch_after_id:
+            try:
+                self.after_cancel(self._watch_after_id)
+            except Exception:
+                pass
+        self._watch_after_id = None
+
+        if self._watch_pending_export_id:
+            try:
+                self.after_cancel(self._watch_pending_export_id)
+            except Exception:
+                pass
+        self._watch_pending_export_id = None
+
+        was_running = self._watch_running
+        self._watch_running = False
+        self._watch_export_in_progress = False
+        self._watch_profile_name = ""
+        self._watch_root = None
+        self._watch_out_path = None
+        self._watch_patterns = []
+        self._watch_exclude_dirs = set()
+        self._watch_snapshot = {}
+        self._watch_poll_interval_ms = 1500
+        self._watch_quiet_period_ms = 1200
+        self._set_watch_status("Stopped")
+        if was_running and log:
+            self._log("Watch stopped.")
+
+    def _watch_tick(self) -> None:
+        self._watch_after_id = None
+        if not self._watch_running:
+            return
+
+        try:
+            if self._watch_root is None or not self._watch_root.exists():
+                raise FileNotFoundError("Watched project folder no longer exists.")
+
+            new_snapshot = self._build_watch_snapshot()
+            added, modified, removed = self._summarize_snapshot_changes(self._watch_snapshot, new_snapshot)
+            self._watch_snapshot = new_snapshot
+
+            if added or modified or removed:
+                self._watch_last_change_summary = (
+                    f"Changes detected at {datetime.now().strftime('%H:%M:%S')} — "
+                    f"added {added}, modified {modified}, removed {removed}."
+                )
+                self._set_watch_status("Waiting quiet period")
+                self._log(
+                    f"Watch change detected for '{self._watch_profile_name}': "
+                    f"added {added}, modified {modified}, removed {removed}."
+                )
+                self._schedule_watch_export()
+            elif not self._watch_pending_export_id and not self._watch_export_in_progress:
+                self._set_watch_status("Monitoring")
+        except Exception as e:
+            self._watch_last_change_summary = f"Watch error: {e}"
+            self._set_watch_status("Error")
+            self._log(f"Watch error: {e}")
+            self._watch_stop(log=False)
+            messagebox.showerror("Watch", str(e))
+            return
+
+        self._schedule_watch_tick()
+
+    def _watch_export_now(self) -> None:
+        self._watch_pending_export_id = None
+        if not self._watch_running or self._watch_export_in_progress:
+            return
+
+        self._watch_export_in_progress = True
+        self._set_watch_status("Exporting")
+        try:
+            included, skipped, out_path = self._run_export(show_message=False)
+            self._watch_last_export_summary = (
+                f"Last automatic export at {datetime.now().strftime('%H:%M:%S')} — "
+                f"included {included}, skipped read errors {skipped}, output {out_path}"
+            )
+            self._watch_snapshot = self._build_watch_snapshot()
+            self._log(f"Watch auto-export completed for '{self._watch_profile_name}'.")
+        except Exception as e:
+            self._watch_last_export_summary = f"Automatic export failed: {e}"
+            self._log(f"Watch auto-export failed: {e}")
+            self._set_watch_status("Error")
+            self._watch_export_in_progress = False
+            self._watch_stop(log=False)
+            messagebox.showerror("Watch", str(e))
+            return
+
+        self._watch_export_in_progress = False
+        if self._watch_running:
+            self._set_watch_status("Monitoring")
+            if self._watch_after_id is None:
+                self._schedule_watch_tick()
+
+    def _run_export(self, show_message: bool = True) -> tuple[int, int, Path]:
+        root = Path(normalize_ui_path(self.project_dir.get())).resolve()
+        if not root.exists():
+            raise FileNotFoundError("Project folder does not exist.")
+
+        patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
+        exclude = {x.lower() for x in parse_csv_list(self.exclude_dirs.get())}
+
+        out = normalize_ui_path(self.output_file.get().strip())
+        out_path = Path(out).resolve() if out else build_default_output(root, self.add_timestamp.get())
+
+        included, skipped = export_to_file(
+            root=root,
+            out_path=out_path,
+            exclude_dirs=exclude,
+            patterns=patterns,
+            skip_binary=self.skip_binary.get(),
+            header_full_path=self.header_full_path.get(),
+        )
+
+        self._save_config(silent=True)
+        self._log(f"OK: exported {included} files -> {out_path} (skipped read errors: {skipped})")
+        if show_message:
+            messagebox.showinfo(
+                "Done",
+                f"Export completed.\nIncluded: {included}\nSkipped read errors: {skipped}\nOutput: {out_path}",
+            )
+        return included, skipped, out_path
 
 
     # ---------- Batch UI / Runner ----------
