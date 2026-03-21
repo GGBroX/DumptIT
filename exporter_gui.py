@@ -325,7 +325,7 @@ class DumpItApp(tk.Tk):
         self._build_batch_tab(self.tab_batch, pad)
 
         # ---------- SHARED LOG ----------
-        self.log = tk.Text(root, height=10, wrap="word")
+        self.log = tk.Text(root, height=5, wrap="word")
         self.log.pack(fill="both", expand=True, **pad)
         self.log.configure(state="disabled")
 
