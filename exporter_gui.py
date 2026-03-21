@@ -188,8 +188,10 @@ class DumpItApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("DumpIt — Source Exporter")
-        self.geometry("860x560")
-        self.minsize(860, 560)
+
+        # Base safe size
+        self.geometry("980x680")
+        self.minsize(980, 680)
 
         # State base
         self.project_dir = tk.StringVar(value=str(get_default_project_dir()))
@@ -205,17 +207,36 @@ class DumpItApp(tk.Tk):
         self._loading_ui = False
         self._cp = configparser.ConfigParser()
         self.config_path = get_config_path()
-        self._active_profile = "Default"  # profile currently applied to the UI
+        self._active_profile = "Default"
 
         self._build_ui()
 
-        # During startup we prefer restoring batch selection from config (not from pre-populated UI)
         self._loading_config = True
         self._load_config()
         self._loading_config = False
         self._ensure_output_default()
 
+        self.after(0, self._apply_dynamic_min_size)
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _apply_dynamic_min_size(self) -> None:
+        self.update_idletasks()
+    
+        pad_w = 24
+        pad_h = 32
+    
+        req_w = self.winfo_reqwidth() + pad_w
+        req_h = self.winfo_reqheight() + pad_h
+    
+        min_w = max(980, req_w)
+        min_h = max(680, req_h)
+    
+        self.minsize(min_w, min_h)
+    
+        cur_w = self.winfo_width()
+        cur_h = self.winfo_height()
+        self.geometry(f"{max(cur_w, min_w)}x{max(cur_h, min_h)}")
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
