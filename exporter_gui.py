@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Optional, Set
+from dataclasses import dataclass
 
 import os
 import sys
@@ -152,28 +153,160 @@ def build_default_output(root: Path, add_ts: bool) -> Path:
     return root / f"{name}.txt"
 
 
-def export_to_file(root: Path, out_path: Path, exclude_dirs: set[str], patterns: list[str],
-                   skip_binary: bool, header_full_path: bool) -> tuple[int, int]:
-    exclude_files = {canon_path(out_path)}
+@dataclass(slots=True)
+class ExportFileEntry:
+    path: Path
+    rel_path: str
+    header_path: str
+    text: str
+    line_count: int
+    modified_at: str
+
+
+def format_file_mtime(p: Path) -> str:
+    try:
+        return datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "unknown"
+
+
+def count_lines(text: str) -> int:
+    if not text:
+        return 0
+    return text.count("\n") + (0 if text.endswith("\n") else 1)
+
+
+def collect_export_entries(
+    root: Path,
+    exclude_dirs: set[str],
+    patterns: list[str],
+    skip_binary: bool,
+    header_full_path: bool,
+    exclude_files: Optional[Set[str]] = None,
+) -> tuple[list[ExportFileEntry], int]:
     files = collect_files(root, exclude_dirs, patterns, skip_binary, exclude_files=exclude_files)
+    entries: list[ExportFileEntry] = []
     skipped = 0
 
-    parts: list[str] = []
     for p in files:
-        header = str(p) if header_full_path else rel_posix(root, p)
-        parts.append(f"===== FILE: {header} =====\n")
         try:
-            parts.append(read_text_safely(p))
+            text = read_text_safely(p)
         except Exception:
             skipped += 1
-            parts.append("[[ERROR reading file]]\n")
+            continue
+
+        rel_path = rel_posix(root, p)
+        header_path = str(p) if header_full_path else rel_path
+        entries.append(
+            ExportFileEntry(
+                path=p,
+                rel_path=rel_path,
+                header_path=header_path,
+                text=text,
+                line_count=count_lines(text),
+                modified_at=format_file_mtime(p),
+            )
+        )
+
+    return entries, skipped
+
+
+def build_project_tree(entries: list[ExportFileEntry]) -> str:
+    tree: dict[str, dict] = {}
+
+    for entry in entries:
+        parts = entry.rel_path.split("/")
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part + "/", {})
+        node[parts[-1]] = entry
+
+    lines: list[str] = []
+
+    def walk(node: dict[str, dict | ExportFileEntry], depth: int) -> None:
+        names = sorted(node.keys(), key=lambda name: (0 if name.endswith("/") else 1, name.lower()))
+        for name in names:
+            value = node[name]
+            indent = "  " * depth
+            if isinstance(value, ExportFileEntry):
+                lines.append(
+                    f"{indent}{name} [lines: {value.line_count} | modified: {value.modified_at}]"
+                )
+            else:
+                lines.append(f"{indent}{name}")
+                walk(value, depth + 1)
+
+    walk(tree, 0)
+    return "\n".join(lines)
+
+
+def render_export_text(
+    root: Path,
+    out_path: Path,
+    profile_name: str,
+    entries: list[ExportFileEntry],
+) -> str:
+    parts: list[str] = []
+    timestamp_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    project_tree = build_project_tree(entries)
+
+    parts.append("===== DUMPIT EXPORT =====\n")
+    parts.append(f"timestamp_utc: {timestamp_utc}\n")
+    parts.append(f"root: {root}\n")
+    parts.append(f"output: {out_path}\n")
+    parts.append(f"profile: {profile_name}\n")
+    parts.append(f"files_included: {len(entries)}\n")
+    parts.append("\n")
+
+    parts.append("===== PROJECT TREE =====\n")
+    if project_tree:
+        parts.append(project_tree)
+        parts.append("\n")
+    else:
+        parts.append("[[NO FILES INCLUDED]]\n")
+    parts.append("\n")
+
+    for entry in entries:
+        parts.append(
+            f"===== FILE: {entry.header_path} | lines={entry.line_count} | modified={entry.modified_at} =====\n"
+        )
+        parts.append(entry.text)
         if not parts[-1].endswith("\n"):
             parts.append("\n")
         parts.append("\n")
 
+    return "".join(parts)
+
+
+def export_to_file(
+    root: Path,
+    out_path: Path,
+    exclude_dirs: set[str],
+    patterns: list[str],
+    skip_binary: bool,
+    header_full_path: bool,
+    profile_name: str = "Default",
+) -> tuple[int, int]:
+    exclude_files = {canon_path(out_path)}
+    entries, skipped = collect_export_entries(
+        root=root,
+        exclude_dirs=exclude_dirs,
+        patterns=patterns,
+        skip_binary=skip_binary,
+        header_full_path=header_full_path,
+        exclude_files=exclude_files,
+    )
+
+    content = render_export_text(
+        root=root,
+        out_path=out_path,
+        profile_name=profile_name,
+        entries=entries,
+    )
+
     ensure_parent_dir(out_path)
-    out_path.write_text("".join(parts), encoding="utf-8")
-    return (len(files) - skipped, skipped)
+    out_path.write_text(content, encoding="utf-8")
+    return (len(entries), skipped)
 
 
 def sanitize_profile_name(name: str) -> str:
@@ -448,6 +581,7 @@ class DumpItApp(tk.Tk):
                 patterns=patterns,
                 skip_binary=self.skip_binary.get(),
                 header_full_path=self.header_full_path.get(),
+                profile_name=(self.profile_name.get().strip() or "Default"),
             )
 
             self._save_config(silent=True)
@@ -1164,6 +1298,7 @@ class DumpItApp(tk.Tk):
             patterns=patterns,
             skip_binary=self.skip_binary.get(),
             header_full_path=self.header_full_path.get(),
+            profile_name=(self.profile_name.get().strip() or "Default"),
         )
 
         self._save_config(silent=True)
@@ -1403,6 +1538,7 @@ class DumpItApp(tk.Tk):
                     patterns=patterns,
                     skip_binary=skip_binary,
                     header_full_path=header_full_path,
+                    profile_name=name,
                 )
                 self._log(f"[{name}] OK: exported {included} files -> {out_path} (skipped read errors: {skipped})")
 
