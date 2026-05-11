@@ -10,6 +10,10 @@ import platform
 import fnmatch
 import configparser
 import hashlib
+import difflib
+import html as html_lib
+import tempfile
+import webbrowser
 from pathlib import Path
 from datetime import datetime
 
@@ -318,6 +322,365 @@ def sanitize_profile_name(name: str) -> str:
     return name
 
 
+DUMP_FILE_HEADER_PREFIX = "===== FILE: "
+DUMP_FILE_HEADER_SUFFIX = " ====="
+
+
+@dataclass(slots=True)
+class DumpSnapshot:
+    source: Path
+    files: dict[str, str]
+
+
+@dataclass(slots=True)
+class DumpDiffResult:
+    old: DumpSnapshot
+    new: DumpSnapshot
+    added: list[str]
+    removed: list[str]
+    modified: list[str]
+    unchanged: list[str]
+
+    @property
+    def changed_count(self) -> int:
+        return len(self.added) + len(self.removed) + len(self.modified)
+
+
+def _extract_dump_file_header(line: str) -> Optional[str]:
+    raw = line.rstrip("\n").rstrip("\r")
+    if not (raw.startswith(DUMP_FILE_HEADER_PREFIX) and raw.endswith(DUMP_FILE_HEADER_SUFFIX)):
+        return None
+
+    inner = raw[len(DUMP_FILE_HEADER_PREFIX):-len(DUMP_FILE_HEADER_SUFFIX)]
+    # Current DumpIt headers are: path | lines=N | modified=...
+    # Older dumps are: path
+    for marker in (" | lines=", " | modified="):
+        if marker in inner:
+            inner = inner.split(marker, 1)[0]
+            break
+    inner = inner.strip()
+    return inner or None
+
+
+def parse_dump_text(source: Path, text: str) -> DumpSnapshot:
+    files: dict[str, str] = {}
+    current_path: str | None = None
+    current_lines: list[str] = []
+
+    def flush_current() -> None:
+        nonlocal current_path, current_lines
+        if current_path is None:
+            return
+        # DumpIt writes one blank separator line after every file. Remove that separator.
+        if current_lines and current_lines[-1] == "\n":
+            current_lines = current_lines[:-1]
+        files[current_path] = "".join(current_lines)
+        current_lines = []
+
+    for line in text.splitlines(keepends=True):
+        header_path = _extract_dump_file_header(line)
+        if header_path is not None:
+            flush_current()
+            current_path = header_path
+            current_lines = []
+        elif current_path is not None:
+            current_lines.append(line)
+
+    flush_current()
+
+    if not files:
+        raise ValueError(f"No DumpIt file sections found in: {source}")
+    return DumpSnapshot(source=source, files=files)
+
+
+def compare_dump_snapshots(old: DumpSnapshot, new: DumpSnapshot) -> DumpDiffResult:
+    old_paths = set(old.files)
+    new_paths = set(new.files)
+    added = sorted(new_paths - old_paths, key=str.lower)
+    removed = sorted(old_paths - new_paths, key=str.lower)
+    common = sorted(old_paths & new_paths, key=str.lower)
+    modified = [p for p in common if old.files[p] != new.files[p]]
+    unchanged = [p for p in common if old.files[p] == new.files[p]]
+    return DumpDiffResult(old=old, new=new, added=added, removed=removed, modified=modified, unchanged=unchanged)
+
+
+def load_dump_diff(old_path: Path, new_path: Path) -> DumpDiffResult:
+    old = parse_dump_text(old_path, read_text_safely(old_path))
+    new = parse_dump_text(new_path, read_text_safely(new_path))
+    return compare_dump_snapshots(old, new)
+
+
+def _split_patch_lines(text: str) -> list[str]:
+    # Dump exports normalize file boundaries; patch output is therefore line-normalized.
+    return text.splitlines()
+
+
+def _unified_patch_chunk(old_text: str, new_text: str, fromfile: str, tofile: str) -> str:
+    lines = difflib.unified_diff(
+        _split_patch_lines(old_text),
+        _split_patch_lines(new_text),
+        fromfile=fromfile,
+        tofile=tofile,
+        lineterm="",
+    )
+    chunk = "\n".join(lines)
+    return (chunk + "\n") if chunk else ""
+
+
+def build_unified_patch(diff: DumpDiffResult) -> str:
+    chunks: list[str] = []
+    for path in diff.removed:
+        chunks.append(_unified_patch_chunk(diff.old.files[path], "", f"a/{path}", "/dev/null"))
+
+    for path in diff.added:
+        chunks.append(_unified_patch_chunk("", diff.new.files[path], "/dev/null", f"b/{path}"))
+
+    for path in diff.modified:
+        chunks.append(_unified_patch_chunk(diff.old.files[path], diff.new.files[path], f"a/{path}", f"b/{path}"))
+
+    chunks = [chunk for chunk in chunks if chunk]
+    return "\n".join(chunks) if chunks else "# DumpIt delta: no differences found.\n"
+
+
+def build_delta_text(diff: DumpDiffResult) -> str:
+    parts: list[str] = []
+    parts.append("===== DUMPIT DELTA =====\n")
+    parts.append(f"created_utc: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n")
+    parts.append(f"old_dump: {diff.old.source}\n")
+    parts.append(f"new_dump: {diff.new.source}\n")
+    parts.append(f"added: {len(diff.added)}\n")
+    parts.append(f"removed: {len(diff.removed)}\n")
+    parts.append(f"modified: {len(diff.modified)}\n")
+    parts.append(f"unchanged: {len(diff.unchanged)}\n\n")
+
+    if not diff.changed_count:
+        parts.append("No differences found.\n")
+        return "".join(parts)
+
+    if diff.added:
+        parts.append("===== ADDED FILES =====\n")
+        for path in diff.added:
+            parts.append(f"+ {path}\n")
+        parts.append("\n")
+
+    if diff.removed:
+        parts.append("===== REMOVED FILES =====\n")
+        for path in diff.removed:
+            parts.append(f"- {path}\n")
+        parts.append("\n")
+
+    if diff.modified:
+        parts.append("===== MODIFIED FILES =====\n")
+        for path in diff.modified:
+            parts.append(f"* {path}\n")
+        parts.append("\n")
+
+    if diff.added:
+        for path in diff.added:
+            parts.append(f"===== ADDED FILE: {path} =====\n")
+            parts.append(diff.new.files[path])
+            if not parts[-1].endswith("\n"):
+                parts.append("\n")
+            parts.append("\n")
+
+    if diff.removed:
+        for path in diff.removed:
+            parts.append(f"===== REMOVED FILE: {path} =====\n")
+            parts.append(diff.old.files[path])
+            if not parts[-1].endswith("\n"):
+                parts.append("\n")
+            parts.append("\n")
+
+    if diff.modified:
+        parts.append("===== UNIFIED DIFF =====\n")
+        parts.append(build_unified_patch(diff))
+        if not parts[-1].endswith("\n"):
+            parts.append("\n")
+
+    return "".join(parts)
+
+
+def _diff_anchor(path: str) -> str:
+    return "file-" + hashlib.sha1(path.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _html_escape(text: str) -> str:
+    return html_lib.escape(text, quote=False)
+
+
+def _render_html_diff_table(old_text: str, new_text: str) -> str:
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+    rows: list[str] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        old_count = i2 - i1
+        new_count = j2 - j1
+        row_count = max(old_count, new_count)
+        css = {
+            "equal": "eq",
+            "delete": "del",
+            "insert": "ins",
+            "replace": "chg",
+        }.get(tag, "chg")
+
+        for offset in range(row_count):
+            old_index = i1 + offset
+            new_index = j1 + offset
+            has_old = old_index < i2
+            has_new = new_index < j2
+            old_no = str(old_index + 1) if has_old else ""
+            new_no = str(new_index + 1) if has_new else ""
+            old_line = _html_escape(old_lines[old_index]) if has_old else ""
+            new_line = _html_escape(new_lines[new_index]) if has_new else ""
+            rows.append(
+                "<tr class='{css}'>"
+                "<td class='ln'>{old_no}</td><td class='code old'>{old_line}</td>"
+                "<td class='ln'>{new_no}</td><td class='code new'>{new_line}</td>"
+                "</tr>".format(css=css, old_no=old_no, old_line=old_line, new_no=new_no, new_line=new_line)
+            )
+
+    if not rows:
+        rows.append("<tr class='eq'><td></td><td class='code'>No line differences.</td><td></td><td></td></tr>")
+
+    return "<table class='diff-table'><tbody>" + "\n".join(rows) + "</tbody></table>"
+
+
+def _render_file_block(diff: DumpDiffResult, status: str, path: str) -> str:
+    safe_path = _html_escape(path)
+    anchor = _diff_anchor(path)
+    badge_class = status.lower()
+
+    if status == "ADDED":
+        table = _render_html_diff_table("", diff.new.files[path])
+    elif status == "REMOVED":
+        table = _render_html_diff_table(diff.old.files[path], "")
+    else:
+        table = _render_html_diff_table(diff.old.files[path], diff.new.files[path])
+
+    return f"""
+<section id="{anchor}" class="file-block" data-path="{html_lib.escape(path.lower())}" data-status="{badge_class}">
+  <div class="file-head">
+    <span class="badge {badge_class}">{status}</span>
+    <h2>{safe_path}</h2>
+  </div>
+  {table}
+</section>
+"""
+
+
+def build_delta_html(diff: DumpDiffResult) -> str:
+    changed: list[tuple[str, str]] = []
+    changed.extend(("ADDED", p) for p in diff.added)
+    changed.extend(("REMOVED", p) for p in diff.removed)
+    changed.extend(("MODIFIED", p) for p in diff.modified)
+
+    nav_items = []
+    for status, path in changed:
+        nav_items.append(
+            f"<a class='nav-item {status.lower()}' href='#{_diff_anchor(path)}' data-path='{html_lib.escape(path.lower())}' data-status='{status.lower()}'>"
+            f"<span>{status[0]}</span>{_html_escape(path)}</a>"
+        )
+
+    if changed:
+        body = "\n".join(_render_file_block(diff, status, path) for status, path in changed)
+    else:
+        body = "<section class='empty'>No differences found.</section>"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DumpIt Diff</title>
+<style>
+:root {{
+  --bg: #0b1020;
+  --panel: #111827;
+  --panel-2: #172033;
+  --text: #e5e7eb;
+  --muted: #9ca3af;
+  --border: #263244;
+  --add: #0f5132;
+  --add-bg: #0d2f22;
+  --del: #842029;
+  --del-bg: #35151a;
+  --chg: #664d03;
+  --chg-bg: #30260c;
+  --eq: #111827;
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }}
+header {{ position: sticky; top: 0; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 22px; background: rgba(11,16,32,.92); border-bottom: 1px solid var(--border); backdrop-filter: blur(10px); }}
+h1 {{ margin: 0; font-size: 18px; font-weight: 700; }}
+.meta {{ color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60vw; }}
+.summary {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.card {{ padding: 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); min-width: 86px; text-align: center; }}
+.card b {{ display: block; font-size: 18px; }}
+.layout {{ display: grid; grid-template-columns: 320px minmax(0, 1fr); min-height: calc(100vh - 82px); }}
+aside {{ position: sticky; top: 82px; align-self: start; height: calc(100vh - 82px); overflow: auto; padding: 14px; border-right: 1px solid var(--border); background: var(--panel); }}
+.search {{ width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: #0b1020; color: var(--text); outline: none; margin-bottom: 12px; }}
+.nav-item {{ display: grid; grid-template-columns: 24px 1fr; gap: 8px; align-items: center; padding: 8px 9px; margin: 4px 0; border: 1px solid transparent; border-radius: 10px; color: var(--text); text-decoration: none; word-break: break-all; }}
+.nav-item:hover {{ border-color: var(--border); background: var(--panel-2); }}
+.nav-item span {{ display: inline-flex; width: 22px; height: 22px; border-radius: 7px; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; }}
+.nav-item.added span, .badge.added {{ background: var(--add); }}
+.nav-item.removed span, .badge.removed {{ background: var(--del); }}
+.nav-item.modified span, .badge.modified {{ background: var(--chg); }}
+main {{ padding: 18px; overflow: hidden; }}
+.file-block {{ margin: 0 0 18px; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; background: var(--panel); box-shadow: 0 12px 40px rgba(0,0,0,.25); }}
+.file-head {{ display: flex; align-items: center; gap: 10px; padding: 12px 14px; background: var(--panel-2); border-bottom: 1px solid var(--border); }}
+.file-head h2 {{ margin: 0; font-size: 14px; font-weight: 650; word-break: break-all; }}
+.badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 800; letter-spacing: .04em; }}
+.diff-table {{ width: 100%; border-collapse: collapse; table-layout: fixed; font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+.diff-table td {{ border-bottom: 1px solid rgba(255,255,255,.04); vertical-align: top; }}
+.ln {{ width: 56px; padding: 3px 8px; color: var(--muted); text-align: right; user-select: none; background: rgba(0,0,0,.16); }}
+.code {{ width: calc(50% - 56px); padding: 3px 10px; white-space: pre-wrap; word-break: break-word; }}
+tr.eq .code {{ background: var(--eq); color: #d1d5db; }}
+tr.ins .new {{ background: var(--add-bg); }}
+tr.ins .old {{ background: rgba(0,0,0,.18); }}
+tr.del .old {{ background: var(--del-bg); }}
+tr.del .new {{ background: rgba(0,0,0,.18); }}
+tr.chg .old, tr.chg .new {{ background: var(--chg-bg); }}
+.empty {{ padding: 40px; border: 1px solid var(--border); border-radius: 16px; background: var(--panel); color: var(--muted); }}
+@media (max-width: 900px) {{ .layout {{ grid-template-columns: 1fr; }} aside {{ position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--border); }} header {{ align-items: flex-start; flex-direction: column; }} .meta {{ max-width: 100%; }} }}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>DumpIt Diff</h1>
+    <div class="meta">Old: {_html_escape(str(diff.old.source))}<br>New: {_html_escape(str(diff.new.source))}</div>
+  </div>
+  <div class="summary">
+    <div class="card"><b>{len(diff.added)}</b>added</div>
+    <div class="card"><b>{len(diff.removed)}</b>removed</div>
+    <div class="card"><b>{len(diff.modified)}</b>modified</div>
+    <div class="card"><b>{len(diff.unchanged)}</b>unchanged</div>
+  </div>
+</header>
+<div class="layout">
+  <aside>
+    <input id="filter" class="search" placeholder="Filter files..." autofocus>
+    <nav id="nav">{''.join(nav_items) if nav_items else '<div class="meta">No changed files.</div>'}</nav>
+  </aside>
+  <main id="content">{body}</main>
+</div>
+<script>
+const filter = document.getElementById('filter');
+filter.addEventListener('input', () => {{
+  const q = filter.value.trim().toLowerCase();
+  document.querySelectorAll('.nav-item, .file-block').forEach(el => {{
+    const path = el.dataset.path || '';
+    el.style.display = path.includes(q) ? '' : 'none';
+  }});
+}});
+</script>
+</body>
+</html>
+"""
+
+
 class DumpItApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -366,6 +729,12 @@ class DumpItApp(tk.Tk):
         self._watch_last_change_summary = "No changes detected yet."
         self._watch_last_export_summary = "No automatic export yet."
 
+        # Diff state
+        self.diff_old_file = tk.StringVar(value="")
+        self.diff_new_file = tk.StringVar(value="")
+        self.diff_output_file = tk.StringVar(value="")
+        self.diff_output_format = tk.StringVar(value="patch")
+
         self._build_ui()
 
         self._loading_config = True
@@ -408,10 +777,12 @@ class DumpItApp(tk.Tk):
         self.tab_export = ttk.Frame(self.nb)
         self.tab_watch = ttk.Frame(self.nb)
         self.tab_batch = ttk.Frame(self.nb)
+        self.tab_diff = ttk.Frame(self.nb)
 
         self.nb.add(self.tab_export, text="Export")
         self.nb.add(self.tab_watch, text="Watch")
         self.nb.add(self.tab_batch, text="Batch")
+        self.nb.add(self.tab_diff, text="Diff")
 
         # ---------- EXPORT TAB ----------
         export_root = self.tab_export
@@ -485,6 +856,9 @@ class DumpItApp(tk.Tk):
 
         # ---------- BATCH TAB ----------
         self._build_batch_tab(self.tab_batch, pad)
+
+        # ---------- DIFF TAB ----------
+        self._build_diff_tab(self.tab_diff, pad)
 
         # ---------- SHARED LOG ----------
         self.log = tk.Text(root, height=5, wrap="word")
@@ -990,6 +1364,186 @@ class DumpItApp(tk.Tk):
             pass
         self._save_config(silent=True)
         self.destroy()
+
+
+    # ---------- Diff UI / Runner ----------
+    def _build_diff_tab(self, parent: ttk.Frame, pad: dict) -> None:
+        info = ttk.LabelFrame(parent, text="Dump diff")
+        info.pack(fill="both", expand=True, **pad)
+
+        desc = ttk.Label(
+            info,
+            text=(
+                "Select two DumpIt export files. The visual diff opens as a local HTML page. "
+                "The delta export can be written as human-readable .txt or unified .patch."
+            ),
+            wraplength=800,
+            justify="left",
+        )
+        desc.pack(fill="x", padx=8, pady=(8, 4))
+
+        old_frame = ttk.LabelFrame(info, text="Old dump")
+        old_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(old_frame, textvariable=self.diff_old_file).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        ttk.Button(old_frame, text="Browse…", command=lambda: self._browse_diff_dump(self.diff_old_file, "Select old dump")).pack(side="left", padx=8, pady=8)
+
+        new_frame = ttk.LabelFrame(info, text="New dump")
+        new_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(new_frame, textvariable=self.diff_new_file).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        ttk.Button(new_frame, text="Browse…", command=lambda: self._browse_diff_dump(self.diff_new_file, "Select new dump")).pack(side="left", padx=8, pady=8)
+
+        output_frame = ttk.LabelFrame(info, text="Delta file")
+        output_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(output_frame, textvariable=self.diff_output_file).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        ttk.Button(output_frame, text="Choose…", command=self._choose_diff_output).pack(side="left", padx=8, pady=8)
+
+        options = ttk.Frame(info)
+        options.pack(fill="x", padx=8, pady=6)
+        ttk.Label(options, text="Format:").pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(options, text=".patch", value="patch", variable=self.diff_output_format, command=self._update_diff_output_extension).pack(side="left", padx=4)
+        ttk.Radiobutton(options, text=".txt", value="txt", variable=self.diff_output_format, command=self._update_diff_output_extension).pack(side="left", padx=4)
+
+        actions = ttk.Frame(info)
+        actions.pack(fill="x", padx=8, pady=6)
+        ttk.Button(actions, text="Open visual diff", command=self._open_visual_diff).pack(side="left", padx=4)
+        ttk.Button(actions, text="Save delta file", command=self._save_delta_file).pack(side="left", padx=4)
+
+        details = ttk.LabelFrame(info, text="Status")
+        details.pack(fill="both", expand=True, padx=8, pady=(6, 10))
+        self.lbl_diff_status = ttk.Label(details, text="No diff loaded.", wraplength=800, justify="left")
+        self.lbl_diff_status.pack(fill="x", padx=8, pady=8)
+
+    def _browse_diff_dump(self, target: tk.StringVar, title: str) -> None:
+        initialdir = str(get_default_project_dir())
+        current = target.get().strip()
+        if current:
+            try:
+                initialdir = str(Path(normalize_ui_path(current)).resolve().parent)
+            except Exception:
+                pass
+
+        f = filedialog.askopenfilename(
+            title=title,
+            initialdir=initialdir,
+            filetypes=[("DumpIt/Text files", "*.txt *.dump"), ("Patch files", "*.patch"), ("All files", "*.*")],
+        )
+        if f:
+            target.set(normalize_ui_path(f))
+            self._suggest_diff_output_if_empty()
+
+    def _get_diff_paths(self) -> tuple[Path, Path]:
+        old_raw = normalize_ui_path(self.diff_old_file.get().strip())
+        new_raw = normalize_ui_path(self.diff_new_file.get().strip())
+        if not old_raw or not new_raw:
+            raise ValueError("Select both dump files.")
+        old_path = Path(old_raw).resolve()
+        new_path = Path(new_raw).resolve()
+        if not old_path.exists():
+            raise FileNotFoundError(f"Old dump does not exist: {old_path}")
+        if not new_path.exists():
+            raise FileNotFoundError(f"New dump does not exist: {new_path}")
+        if old_path == new_path:
+            raise ValueError("Select two different dump files.")
+        return old_path, new_path
+
+    def _load_current_diff(self) -> DumpDiffResult:
+        old_path, new_path = self._get_diff_paths()
+        diff = load_dump_diff(old_path, new_path)
+        self._set_diff_status(diff)
+        return diff
+
+    def _set_diff_status(self, diff: DumpDiffResult) -> None:
+        text = (
+            f"Compared {len(diff.old.files)} old files against {len(diff.new.files)} new files. "
+            f"Added {len(diff.added)}, removed {len(diff.removed)}, modified {len(diff.modified)}, unchanged {len(diff.unchanged)}."
+        )
+        self.lbl_diff_status.configure(text=text)
+
+    def _suggest_diff_output_if_empty(self) -> None:
+        if self.diff_output_file.get().strip():
+            return
+        try:
+            old_path, new_path = self._get_diff_paths()
+        except Exception:
+            return
+        ext = ".patch" if self.diff_output_format.get() == "patch" else ".txt"
+        base = f"{old_path.stem}_to_{new_path.stem}_delta{ext}"
+        self.diff_output_file.set(normalize_ui_path(str(new_path.with_name(base))))
+
+    def _update_diff_output_extension(self) -> None:
+        current = self.diff_output_file.get().strip()
+        if not current:
+            self._suggest_diff_output_if_empty()
+            return
+        ext = ".patch" if self.diff_output_format.get() == "patch" else ".txt"
+        try:
+            p = Path(normalize_ui_path(current))
+            self.diff_output_file.set(normalize_ui_path(str(p.with_suffix(ext))))
+        except Exception:
+            pass
+
+    def _choose_diff_output(self) -> None:
+        self._suggest_diff_output_if_empty()
+        ext = ".patch" if self.diff_output_format.get() == "patch" else ".txt"
+        current = self.diff_output_file.get().strip()
+        initialdir = str(get_default_project_dir())
+        initialfile = f"dumpit_delta{ext}"
+        if current:
+            try:
+                curp = Path(normalize_ui_path(current)).resolve()
+                initialdir = str(curp.parent)
+                initialfile = curp.name
+            except Exception:
+                pass
+
+        f = filedialog.asksaveasfilename(
+            title="Choose delta file",
+            initialdir=initialdir,
+            initialfile=initialfile,
+            defaultextension=ext,
+            filetypes=[("Patch file", "*.patch"), ("Text file", "*.txt"), ("All files", "*.*")],
+        )
+        if f:
+            self.diff_output_file.set(normalize_ui_path(f))
+            suffix = Path(f).suffix.lower()
+            if suffix == ".txt":
+                self.diff_output_format.set("txt")
+            elif suffix == ".patch":
+                self.diff_output_format.set("patch")
+
+    def _open_visual_diff(self) -> None:
+        try:
+            diff = self._load_current_diff()
+            html = build_delta_html(diff)
+            out_dir = Path(tempfile.gettempdir()) / APP_NAME
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"dumpit_diff_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            out_path.write_text(html, encoding="utf-8")
+            webbrowser.open(out_path.as_uri())
+            self._log(f"Diff HTML opened: {out_path}")
+        except Exception as e:
+            messagebox.showerror("Diff", str(e))
+
+    def _save_delta_file(self) -> None:
+        try:
+            diff = self._load_current_diff()
+            self._suggest_diff_output_if_empty()
+            out_raw = normalize_ui_path(self.diff_output_file.get().strip())
+            if not out_raw:
+                self._choose_diff_output()
+                out_raw = normalize_ui_path(self.diff_output_file.get().strip())
+            if not out_raw:
+                return
+
+            out_path = Path(out_raw).resolve()
+            fmt = self.diff_output_format.get()
+            content = build_unified_patch(diff) if fmt == "patch" else build_delta_text(diff)
+            ensure_parent_dir(out_path)
+            out_path.write_text(content, encoding="utf-8")
+            self._log(f"Diff delta saved: {out_path}")
+            messagebox.showinfo("Diff", f"Delta saved.\nOutput: {out_path}")
+        except Exception as e:
+            messagebox.showerror("Diff", str(e))
 
 
     def _build_watch_tab(self, parent: ttk.Frame, pad: dict) -> None:
