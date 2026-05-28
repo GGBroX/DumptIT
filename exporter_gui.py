@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from typing import Optional, Set
+from typing import Optional, Set, Callable
 from dataclasses import dataclass
 
 import os
@@ -192,6 +192,169 @@ def run_git_apply_patch(
     if proc.returncode == 0:
         return True, output or "OK"
     return False, output or f"git apply failed with exit code {proc.returncode}"
+
+
+@dataclass(slots=True, frozen=True)
+class PatchApplyPlan:
+    root: Path
+    strip_level: int
+    check_output: str
+    attempts: tuple[str, ...]
+
+
+def _unique_existing_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for path in paths:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        key = canon_path(resolved)
+        if key in seen or not resolved.exists() or not resolved.is_dir():
+            continue
+        seen.add(key)
+        out.append(resolved)
+    return out
+
+
+def _candidate_patch_roots(profile_root: Path) -> list[Path]:
+    # Batch profiles may point either to the repo root or to a source subfolder such as ./app.
+    # Try the selected folder first, then a small number of parents.
+    candidates = [profile_root]
+    parent = profile_root
+    for _ in range(3):
+        parent = parent.parent
+        candidates.append(parent)
+    return _unique_existing_paths(candidates)
+
+
+def _candidate_strip_levels(preferred: int) -> list[int]:
+    levels = [preferred, 0, 1, 2, 3, 4]
+    out: list[int] = []
+    for level in levels:
+        if level >= 0 and level not in out:
+            out.append(level)
+    return out
+
+
+def _short_first_error(output: str, max_len: int = 220) -> str:
+    text = " ".join((output or "").split())
+    if not text:
+        return "git apply failed"
+    return text[:max_len] + ("..." if len(text) > max_len else "")
+
+
+def detect_git_apply_plan(
+    *,
+    profile_root: Path,
+    patch_path: Path,
+    preferred_strip_level: int,
+    reverse: bool,
+) -> PatchApplyPlan:
+    attempts: list[str] = []
+    last_error = ""
+
+    for root in _candidate_patch_roots(profile_root):
+        for strip_level in _candidate_strip_levels(preferred_strip_level):
+            ok, output = run_git_apply_patch(
+                root=root,
+                patch_path=patch_path,
+                strip_level=strip_level,
+                reverse=reverse,
+                check_only=True,
+            )
+            marker = "OK" if ok else "FAIL"
+            attempts.append(f"{marker} cwd={root} -p{strip_level}: {_short_first_error(output)}")
+            if ok:
+                return PatchApplyPlan(root=root, strip_level=strip_level, check_output=output, attempts=tuple(attempts))
+            last_error = output
+
+    detail = "\n".join(attempts[-12:])
+    raise RuntimeError(
+        "No valid cwd/-p combination found. Last error: "
+        f"{_short_first_error(last_error, 500)}"
+        + ("\nAttempts:\n" + detail if detail else "")
+    )
+
+
+def enable_windows_file_drop(widget: tk.Widget, callback: Callable[[list[str]], None]) -> object | None:
+    """Enable best-effort Windows Explorer file drop for a Tk widget/window.
+
+    Tkinter has no portable native file drop. This uses WM_DROPFILES on Windows only.
+    It is optional and safely returns None if unavailable.
+    """
+    if not platform.system().lower().startswith("win"):
+        return None
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        widget.update_idletasks()
+        hwnd = widget.winfo_id()
+        if not hwnd:
+            return None
+
+        WM_DROPFILES = 0x0233
+        GWL_WNDPROC = -4
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            SetWindowLongPtr = user32.SetWindowLongPtrW
+            SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            SetWindowLongPtr.restype = ctypes.c_void_p
+            CallWindowProc = user32.CallWindowProcW
+            CallWindowProc.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            CallWindowProc.restype = LRESULT
+        else:
+            SetWindowLongPtr = user32.SetWindowLongW
+            SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            SetWindowLongPtr.restype = ctypes.c_void_p
+            CallWindowProc = user32.CallWindowProcW
+            CallWindowProc.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            CallWindowProc.restype = LRESULT
+
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        shell32.DragAcceptFiles.restype = None
+        shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        shell32.DragFinish.argtypes = [wintypes.HANDLE]
+        shell32.DragFinish.restype = None
+
+        old_proc = ctypes.c_void_p()
+
+        def _wndproc(hwnd_, msg, wparam, lparam):
+            if msg == WM_DROPFILES:
+                paths: list[str] = []
+                try:
+                    count = shell32.DragQueryFileW(wparam, 0xFFFFFFFF, None, 0)
+                    for i in range(count):
+                        length = shell32.DragQueryFileW(wparam, i, None, 0)
+                        buf = ctypes.create_unicode_buffer(length + 1)
+                        shell32.DragQueryFileW(wparam, i, buf, length + 1)
+                        if buf.value:
+                            paths.append(buf.value)
+                finally:
+                    shell32.DragFinish(wparam)
+                if paths:
+                    widget.after(0, lambda ps=paths: callback(ps))
+                return 0
+            return CallWindowProc(old_proc.value, hwnd_, msg, wparam, lparam)
+
+        new_proc = WNDPROC(_wndproc)
+        old = SetWindowLongPtr(hwnd, GWL_WNDPROC, ctypes.cast(new_proc, ctypes.c_void_p))
+        if not old:
+            return None
+        old_proc.value = old
+        shell32.DragAcceptFiles(hwnd, True)
+        return {"hwnd": hwnd, "old_proc": old_proc, "new_proc": new_proc}
+    except Exception:
+        return None
 
 
 def parse_csv_list(s: str) -> list[str]:
@@ -935,17 +1098,22 @@ class DumpItApp(tk.Tk):
 
         # Apply Patch state
         self.patch_file = tk.StringVar(value="")
+        self.patch_target_dir = tk.StringVar(value=str(get_default_project_dir()))
         self.patch_strip_level = tk.StringVar(value="1")
         self.patch_reverse = tk.BooleanVar(value=False)
         self.patch_backup = tk.BooleanVar(value=True)
+        self.patch_auto_detect = tk.BooleanVar(value=True)
+        self._patch_drop_ref = None
 
         self._build_ui()
         self._cleanup_diff_temp_html(log=True)
+        self.after(250, self._enable_patch_file_drop)
 
         self._loading_config = True
         self._load_config()
         self._loading_config = False
         self._ensure_output_default()
+        self.patch_target_dir.set(normalize_ui_path(self.project_dir.get()))
 
         self.after(0, self._apply_dynamic_min_size)
 
@@ -1327,9 +1495,9 @@ class DumpItApp(tk.Tk):
                 self.lbl_batch_status.configure(text=f"{total} profiles — selected {sel}")
             except Exception:
                 pass
-        if hasattr(self, "lbl_apply_patch_targets"):
+        if hasattr(self, "lbl_apply_patch_target"):
             try:
-                self._refresh_apply_patch_targets()
+                self._refresh_apply_patch_target()
             except Exception:
                 pass
 
@@ -1771,14 +1939,15 @@ class DumpItApp(tk.Tk):
 
     # ---------- Apply Patch UI / Runner ----------
     def _build_apply_patch_tab(self, parent: ttk.Frame, pad: dict) -> None:
-        info = ttk.LabelFrame(parent, text="Apply patch to active batch")
+        info = ttk.LabelFrame(parent, text="Apply patch — v5")
         info.pack(fill="both", expand=True, **pad)
 
         desc = ttk.Label(
             info,
             text=(
-                "Select a .patch file, then apply it to the project folders of the profiles "
-                "currently selected in the Batch tab. Dry run uses git apply --check."
+                "Select one .patch/.diff file and one target folder. "
+                "This tab does not use Batch selection. Dry run uses git apply --check. "
+                "Auto-detect tries the target folder, parent folders, and -p levels."
             ),
             wraplength=800,
             justify="left",
@@ -1790,6 +1959,12 @@ class DumpItApp(tk.Tk):
         ttk.Entry(patch_frame, textvariable=self.patch_file).pack(side="left", fill="x", expand=True, padx=8, pady=8)
         ttk.Button(patch_frame, text="Browse…", command=self._browse_patch_file).pack(side="left", padx=8, pady=8)
 
+        target_frame = ttk.LabelFrame(info, text="Target folder")
+        target_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(target_frame, textvariable=self.patch_target_dir).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        ttk.Button(target_frame, text="Current project", command=lambda: self._set_patch_target_to_current_project(log=True)).pack(side="left", padx=4, pady=8)
+        ttk.Button(target_frame, text="Browse…", command=self._browse_patch_target_dir).pack(side="left", padx=8, pady=8)
+
         options = ttk.LabelFrame(info, text="Options")
         options.pack(fill="x", padx=8, pady=6)
         opt_grid = ttk.Frame(options)
@@ -1798,27 +1973,28 @@ class DumpItApp(tk.Tk):
         ttk.Label(opt_grid, text="Strip level (-p)").grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Entry(opt_grid, textvariable=self.patch_strip_level, width=8).grid(row=0, column=1, sticky="w", padx=6, pady=4)
         ttk.Checkbutton(opt_grid, text="Reverse patch (-R)", variable=self.patch_reverse).grid(row=0, column=2, sticky="w", padx=16, pady=4)
-        ttk.Checkbutton(opt_grid, text="Backup existing touched files before apply", variable=self.patch_backup).grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(opt_grid, text="Auto-detect target root / strip level", variable=self.patch_auto_detect).grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(opt_grid, text="Backup existing touched files before apply", variable=self.patch_backup).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=4)
 
-        targets = ttk.LabelFrame(info, text="Targets from active Batch selection")
-        targets.pack(fill="x", padx=8, pady=6)
-        target_row = ttk.Frame(targets)
+        target_status = ttk.LabelFrame(info, text="Resolved target")
+        target_status.pack(fill="x", padx=8, pady=6)
+        target_row = ttk.Frame(target_status)
         target_row.pack(fill="x", padx=8, pady=8)
-        self.lbl_apply_patch_targets = ttk.Label(target_row, text="No batch targets loaded.", wraplength=760, justify="left")
-        self.lbl_apply_patch_targets.pack(side="left", fill="x", expand=True)
-        ttk.Button(target_row, text="Refresh targets", command=self._refresh_apply_patch_targets).pack(side="right", padx=4)
+        self.lbl_apply_patch_target = ttk.Label(target_row, text="No target loaded.", wraplength=760, justify="left")
+        self.lbl_apply_patch_target.pack(side="left", fill="x", expand=True)
+        ttk.Button(target_row, text="Refresh", command=self._refresh_apply_patch_target).pack(side="right", padx=4)
 
         actions = ttk.Frame(info)
         actions.pack(fill="x", padx=8, pady=6)
-        ttk.Button(actions, text="Dry run batch", command=lambda: self._apply_patch_to_active_batch(dry_run=True)).pack(side="left", padx=4)
-        ttk.Button(actions, text="Apply to batch", command=lambda: self._apply_patch_to_active_batch(dry_run=False)).pack(side="left", padx=4)
+        ttk.Button(actions, text="Dry run", command=lambda: self._apply_patch_to_target(dry_run=True)).pack(side="left", padx=4)
+        ttk.Button(actions, text="Apply", command=lambda: self._apply_patch_to_target(dry_run=False)).pack(side="left", padx=4)
 
         details = ttk.LabelFrame(info, text="Status")
         details.pack(fill="both", expand=True, padx=8, pady=(6, 10))
         self.lbl_apply_patch_status = ttk.Label(details, text="No patch checked.", wraplength=800, justify="left")
         self.lbl_apply_patch_status.pack(fill="x", padx=8, pady=8)
 
-        self._refresh_apply_patch_targets()
+        self._refresh_apply_patch_target()
 
     def _browse_patch_file(self) -> None:
         initialdir = str(get_default_project_dir())
@@ -1836,6 +2012,46 @@ class DumpItApp(tk.Tk):
         )
         if f:
             self.patch_file.set(normalize_ui_path(f))
+
+    def _browse_patch_target_dir(self) -> None:
+        initialdir = normalize_ui_path(self.patch_target_dir.get().strip()) or normalize_ui_path(self.project_dir.get()) or str(get_default_project_dir())
+        d = filedialog.askdirectory(title="Select target folder", initialdir=initialdir)
+        if d:
+            self.patch_target_dir.set(normalize_ui_path(d))
+            self._refresh_apply_patch_target()
+
+    def _set_patch_target_to_current_project(self, log: bool = False) -> None:
+        target = normalize_ui_path(self.project_dir.get().strip()) or str(get_default_project_dir())
+        self.patch_target_dir.set(target)
+        self._refresh_apply_patch_target()
+        if log:
+            self._log(f"Apply Patch target set to current project: {target}")
+
+    def _handle_patch_file_drop(self, paths: list[str]) -> None:
+        for raw in paths:
+            try:
+                p = Path(normalize_ui_path(raw)).resolve()
+            except Exception:
+                continue
+            if p.is_file() and p.suffix.lower() in {".patch", ".diff"}:
+                self.patch_file.set(normalize_ui_path(str(p)))
+                self._log(f"Patch file selected by drop: {p}")
+                return
+            if p.is_dir():
+                self.patch_target_dir.set(normalize_ui_path(str(p)))
+                self._refresh_apply_patch_target()
+                self._log(f"Patch target selected by drop: {p}")
+                return
+        if paths:
+            self._log("Drop ignored: no .patch/.diff file or folder found.")
+
+    def _enable_patch_file_drop(self) -> None:
+        if getattr(self, "_patch_drop_ref", None) is not None:
+            return
+        ref = enable_windows_file_drop(self, self._handle_patch_file_drop)
+        self._patch_drop_ref = ref
+        if ref is not None:
+            self._log("Windows file drop enabled for .patch/.diff files and folders.")
 
     def _get_patch_path_and_strip_level(self) -> tuple[Path, int]:
         patch_raw = normalize_ui_path(self.patch_file.get().strip())
@@ -1856,109 +2072,109 @@ class DumpItApp(tk.Tk):
             raise ValueError("Strip level cannot be negative.")
         return patch_path, strip_level
 
-    def _get_active_batch_patch_targets(self) -> list[tuple[str, Path]]:
-        selected = self._get_selected_batch_profiles()
-        targets: list[tuple[str, Path]] = []
-        for name in selected:
-            root, _out_path, _patterns, _exclude_dirs, _skip_binary, _header_full_path = self._read_profile_settings(name)
-            targets.append((name, root))
-        return targets
+    def _get_patch_target_dir(self) -> Path:
+        target_raw = normalize_ui_path(self.patch_target_dir.get().strip())
+        if not target_raw:
+            raise ValueError("Select a target folder.")
+        target = Path(target_raw).resolve()
+        if not target.exists():
+            raise FileNotFoundError(f"Target folder does not exist: {target}")
+        if not target.is_dir():
+            raise ValueError(f"Target path is not a folder: {target}")
+        return target
 
-    def _refresh_apply_patch_targets(self) -> None:
-        if not hasattr(self, "lbl_apply_patch_targets"):
+    def _refresh_apply_patch_target(self) -> None:
+        if not hasattr(self, "lbl_apply_patch_target"):
             return
         try:
-            targets = self._get_active_batch_patch_targets()
+            target = self._get_patch_target_dir()
+            self.lbl_apply_patch_target.configure(text=f"Target: {target}")
         except Exception as e:
-            self.lbl_apply_patch_targets.configure(text=f"Target read error: {e}")
-            return
+            self.lbl_apply_patch_target.configure(text=f"Target error: {e}")
 
-        if not targets:
-            self.lbl_apply_patch_targets.configure(text="No selected Batch profiles. Select target profiles in the Batch tab.")
-            return
+    # Backward-compatible alias for older callbacks/config refresh paths.
+    def _refresh_apply_patch_targets(self) -> None:
+        self._refresh_apply_patch_target()
 
-        lines = [f"{name}: {root}" for name, root in targets]
-        self.lbl_apply_patch_targets.configure(text="\n".join(lines))
-
-    def _apply_patch_to_active_batch(self, dry_run: bool) -> None:
+    def _apply_patch_to_target(self, dry_run: bool) -> None:
         try:
             patch_path, strip_level = self._get_patch_path_and_strip_level()
-            targets = self._get_active_batch_patch_targets()
-            if not targets:
-                raise ValueError("Select at least one target profile in the Batch tab.")
+            target = self._get_patch_target_dir()
         except Exception as e:
             messagebox.showerror("Apply Patch", str(e))
             return
 
         if not dry_run:
-            names = ", ".join(name for name, _root in targets)
             if not messagebox.askyesno(
                 "Apply Patch",
-                f"Apply patch to {len(targets)} target(s)?\n\n{names}\n\nPatch: {patch_path}",
+                f"Apply patch to this target folder?\n\nTarget: {target}\n\nPatch: {patch_path}",
             ):
                 return
 
-        ok_count = 0
-        err_count = 0
-        summaries: list[str] = []
         action = "dry-run" if dry_run else "apply"
         reverse = self.patch_reverse.get()
+        auto_detect = self.patch_auto_detect.get()
+        summaries: list[str] = []
 
-        self._log(f"Patch {action} started: {patch_path} -> {len(targets)} target(s), -p{strip_level}, reverse={reverse}")
+        self._log(
+            f"Patch {action} started: {patch_path} -> target={target}, "
+            f"preferred -p{strip_level}, reverse={reverse}, auto_detect={auto_detect}"
+        )
 
-        for name, root in targets:
-            try:
-                if not root.exists():
-                    raise FileNotFoundError(f"Project folder does not exist: {root}")
-
-                check_ok, check_output = run_git_apply_patch(
-                    root=root,
+        try:
+            if auto_detect:
+                plan = detect_git_apply_plan(
+                    profile_root=target,
                     patch_path=patch_path,
-                    strip_level=strip_level,
+                    preferred_strip_level=strip_level,
+                    reverse=reverse,
+                )
+                effective_root = plan.root
+                effective_strip = plan.strip_level
+                self._log(f"[Apply Patch] Plan: cwd={effective_root}, -p{effective_strip}")
+                for attempt in plan.attempts:
+                    self._log(f"[Apply Patch]   {attempt}")
+            else:
+                effective_root = target
+                effective_strip = strip_level
+                check_ok, check_output = run_git_apply_patch(
+                    root=effective_root,
+                    patch_path=patch_path,
+                    strip_level=effective_strip,
                     reverse=reverse,
                     check_only=True,
                 )
                 if not check_ok:
                     raise RuntimeError(check_output)
 
-                backup_text = ""
-                if not dry_run and self.patch_backup.get():
-                    backup_dir, backed_up = create_patch_backup(root, patch_path, strip_level)
-                    if backup_dir:
-                        backup_text = f" backup={backup_dir} ({backed_up} file(s))"
-                    else:
-                        backup_text = " backup=none"
+            backup_text = ""
+            if not dry_run and self.patch_backup.get():
+                backup_dir, backed_up = create_patch_backup(effective_root, patch_path, effective_strip)
+                if backup_dir:
+                    backup_text = f" backup={backup_dir} ({backed_up} file(s))"
+                else:
+                    backup_text = " backup=none"
 
-                if not dry_run:
-                    apply_ok, apply_output = run_git_apply_patch(
-                        root=root,
-                        patch_path=patch_path,
-                        strip_level=strip_level,
-                        reverse=reverse,
-                        check_only=False,
-                    )
-                    if not apply_ok:
-                        raise RuntimeError(apply_output)
+            if not dry_run:
+                apply_ok, apply_output = run_git_apply_patch(
+                    root=effective_root,
+                    patch_path=patch_path,
+                    strip_level=effective_strip,
+                    reverse=reverse,
+                    check_only=False,
+                )
+                if not apply_ok:
+                    raise RuntimeError(apply_output)
 
-                ok_count += 1
-                msg = f"[{name}] OK: {root}{backup_text}"
-                summaries.append(msg)
-                self._log(msg)
-            except Exception as e:
-                err_count += 1
-                msg = f"[{name}] ERROR: {e}"
-                summaries.append(msg)
-                self._log(msg)
-
-        status = f"Patch {action} completed. OK {ok_count}, errors {err_count}."
-        if summaries:
-            status += "\n" + "\n".join(summaries[-10:])
-        self.lbl_apply_patch_status.configure(text=status)
-
-        if err_count:
-            messagebox.showwarning("Apply Patch", status)
-        else:
+            status = f"Patch {action} completed. OK. cwd={effective_root}, -p{effective_strip}{backup_text}"
+            self.lbl_apply_patch_status.configure(text=status)
+            self._log(status)
             messagebox.showinfo("Apply Patch", status)
+        except Exception as e:
+            status = f"Patch {action} failed. ERROR: {e}"
+            self.lbl_apply_patch_status.configure(text=status)
+            self._log(status)
+            messagebox.showerror("Apply Patch", status)
 
 
     def _build_watch_tab(self, parent: ttk.Frame, pad: dict) -> None:
