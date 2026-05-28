@@ -14,6 +14,8 @@ import difflib
 import html as html_lib
 import tempfile
 import webbrowser
+import shutil
+import subprocess
 from pathlib import Path
 from datetime import datetime
 
@@ -79,6 +81,117 @@ def cleanup_diff_temp_html_files() -> tuple[int, int]:
         except Exception:
             failed += 1
     return deleted, failed
+
+
+def _normalize_patch_raw_path(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    # Unified diff paths may be followed by timestamps separated by tabs/spaces.
+    raw = raw.split("\t", 1)[0].strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        raw = raw[1:-1]
+    return raw.replace("\\", "/")
+
+
+def _strip_patch_path(raw_path: str, strip_level: int) -> str | None:
+    raw_path = _normalize_patch_raw_path(raw_path)
+    if not raw_path or raw_path == "/dev/null":
+        return None
+
+    # Ignore absolute paths and drive-prefixed paths before stripping.
+    if raw_path.startswith("/") or (len(raw_path) >= 3 and raw_path[1:3] == ":/"):
+        return None
+
+    parts = [part for part in raw_path.split("/") if part not in ("", ".")]
+    if strip_level > 0:
+        parts = parts[strip_level:]
+    if not parts:
+        return None
+    if any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def collect_unified_patch_target_paths(patch_path: Path, strip_level: int) -> set[str]:
+    """Return target relative paths touched by a unified patch.
+
+    This is intentionally conservative. It is used only for backup creation;
+    git apply is still the source of truth for actual patch validation/application.
+    """
+    touched: set[str] = set()
+    old_path: str | None = None
+
+    for line in read_text_safely(patch_path).splitlines():
+        if line.startswith("--- "):
+            old_path = line[4:].strip()
+            continue
+        if line.startswith("+++ "):
+            new_path = line[4:].strip()
+            candidate = new_path if _normalize_patch_raw_path(new_path) != "/dev/null" else old_path
+            rel = _strip_patch_path(candidate or "", strip_level)
+            if rel:
+                touched.add(rel)
+            old_path = None
+
+    return touched
+
+
+def create_patch_backup(root: Path, patch_path: Path, strip_level: int) -> tuple[Path | None, int]:
+    touched = collect_unified_patch_target_paths(patch_path, strip_level)
+    existing = []
+    for rel in sorted(touched, key=str.lower):
+        src = root / Path(*rel.split("/"))
+        try:
+            if src.is_file():
+                existing.append((rel, src))
+        except OSError:
+            pass
+
+    if not existing:
+        return None, 0
+
+    backup_root = root / ".dumpit_patch_backup" / datetime.now().strftime("%Y%m%d_%H%M%S")
+    for rel, src in existing:
+        dst = backup_root / Path(*rel.split("/"))
+        ensure_parent_dir(dst)
+        shutil.copy2(src, dst)
+    return backup_root, len(existing)
+
+
+def run_git_apply_patch(
+    *,
+    root: Path,
+    patch_path: Path,
+    strip_level: int,
+    reverse: bool,
+    check_only: bool,
+) -> tuple[bool, str]:
+    git = shutil.which("git")
+    if not git:
+        return False, "git.exe not found in PATH. Install Git for Windows or add git.exe to PATH."
+
+    cmd = [git, "apply"]
+    if check_only:
+        cmd.append("--check")
+    if reverse:
+        cmd.append("-R")
+    cmd.append(f"-p{strip_level}")
+    cmd.append(str(patch_path))
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system().lower().startswith("win") else 0
+    proc = subprocess.run(
+        cmd,
+        cwd=str(root),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=creationflags,
+    )
+    output = "\n".join(x for x in [proc.stdout.strip(), proc.stderr.strip()] if x)
+    if proc.returncode == 0:
+        return True, output or "OK"
+    return False, output or f"git apply failed with exit code {proc.returncode}"
 
 
 def parse_csv_list(s: str) -> list[str]:
@@ -820,6 +933,12 @@ class DumpItApp(tk.Tk):
         self.diff_output_file = tk.StringVar(value="")
         self.diff_output_format = tk.StringVar(value="patch")
 
+        # Apply Patch state
+        self.patch_file = tk.StringVar(value="")
+        self.patch_strip_level = tk.StringVar(value="1")
+        self.patch_reverse = tk.BooleanVar(value=False)
+        self.patch_backup = tk.BooleanVar(value=True)
+
         self._build_ui()
         self._cleanup_diff_temp_html(log=True)
 
@@ -864,11 +983,13 @@ class DumpItApp(tk.Tk):
         self.tab_watch = ttk.Frame(self.nb)
         self.tab_batch = ttk.Frame(self.nb)
         self.tab_diff = ttk.Frame(self.nb)
+        self.tab_apply_patch = ttk.Frame(self.nb)
 
         self.nb.add(self.tab_export, text="Export")
         self.nb.add(self.tab_watch, text="Watch")
         self.nb.add(self.tab_batch, text="Batch")
         self.nb.add(self.tab_diff, text="Diff")
+        self.nb.add(self.tab_apply_patch, text="Apply Patch")
 
         # ---------- EXPORT TAB ----------
         export_root = self.tab_export
@@ -945,6 +1066,9 @@ class DumpItApp(tk.Tk):
 
         # ---------- DIFF TAB ----------
         self._build_diff_tab(self.tab_diff, pad)
+
+        # ---------- APPLY PATCH TAB ----------
+        self._build_apply_patch_tab(self.tab_apply_patch, pad)
 
         # ---------- SHARED LOG ----------
         self.log = tk.Text(root, height=5, wrap="word")
@@ -1201,6 +1325,11 @@ class DumpItApp(tk.Tk):
                 total = len(self._get_profile_names())
                 sel = len(self._get_selected_batch_profiles())
                 self.lbl_batch_status.configure(text=f"{total} profiles — selected {sel}")
+            except Exception:
+                pass
+        if hasattr(self, "lbl_apply_patch_targets"):
+            try:
+                self._refresh_apply_patch_targets()
             except Exception:
                 pass
 
@@ -1638,6 +1767,198 @@ class DumpItApp(tk.Tk):
             messagebox.showinfo("Diff", f"Delta saved.\nOutput: {out_path}")
         except Exception as e:
             messagebox.showerror("Diff", str(e))
+
+
+    # ---------- Apply Patch UI / Runner ----------
+    def _build_apply_patch_tab(self, parent: ttk.Frame, pad: dict) -> None:
+        info = ttk.LabelFrame(parent, text="Apply patch to active batch")
+        info.pack(fill="both", expand=True, **pad)
+
+        desc = ttk.Label(
+            info,
+            text=(
+                "Select a .patch file, then apply it to the project folders of the profiles "
+                "currently selected in the Batch tab. Dry run uses git apply --check."
+            ),
+            wraplength=800,
+            justify="left",
+        )
+        desc.pack(fill="x", padx=8, pady=(8, 4))
+
+        patch_frame = ttk.LabelFrame(info, text="Patch file")
+        patch_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(patch_frame, textvariable=self.patch_file).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        ttk.Button(patch_frame, text="Browse…", command=self._browse_patch_file).pack(side="left", padx=8, pady=8)
+
+        options = ttk.LabelFrame(info, text="Options")
+        options.pack(fill="x", padx=8, pady=6)
+        opt_grid = ttk.Frame(options)
+        opt_grid.pack(fill="x", padx=8, pady=8)
+
+        ttk.Label(opt_grid, text="Strip level (-p)").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(opt_grid, textvariable=self.patch_strip_level, width=8).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(opt_grid, text="Reverse patch (-R)", variable=self.patch_reverse).grid(row=0, column=2, sticky="w", padx=16, pady=4)
+        ttk.Checkbutton(opt_grid, text="Backup existing touched files before apply", variable=self.patch_backup).grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+
+        targets = ttk.LabelFrame(info, text="Targets from active Batch selection")
+        targets.pack(fill="x", padx=8, pady=6)
+        target_row = ttk.Frame(targets)
+        target_row.pack(fill="x", padx=8, pady=8)
+        self.lbl_apply_patch_targets = ttk.Label(target_row, text="No batch targets loaded.", wraplength=760, justify="left")
+        self.lbl_apply_patch_targets.pack(side="left", fill="x", expand=True)
+        ttk.Button(target_row, text="Refresh targets", command=self._refresh_apply_patch_targets).pack(side="right", padx=4)
+
+        actions = ttk.Frame(info)
+        actions.pack(fill="x", padx=8, pady=6)
+        ttk.Button(actions, text="Dry run batch", command=lambda: self._apply_patch_to_active_batch(dry_run=True)).pack(side="left", padx=4)
+        ttk.Button(actions, text="Apply to batch", command=lambda: self._apply_patch_to_active_batch(dry_run=False)).pack(side="left", padx=4)
+
+        details = ttk.LabelFrame(info, text="Status")
+        details.pack(fill="both", expand=True, padx=8, pady=(6, 10))
+        self.lbl_apply_patch_status = ttk.Label(details, text="No patch checked.", wraplength=800, justify="left")
+        self.lbl_apply_patch_status.pack(fill="x", padx=8, pady=8)
+
+        self._refresh_apply_patch_targets()
+
+    def _browse_patch_file(self) -> None:
+        initialdir = str(get_default_project_dir())
+        current = normalize_ui_path(self.patch_file.get().strip())
+        if current:
+            try:
+                initialdir = str(Path(current).resolve().parent)
+            except Exception:
+                pass
+
+        f = filedialog.askopenfilename(
+            title="Select patch file",
+            initialdir=initialdir,
+            filetypes=[("Patch files", "*.patch *.diff"), ("All files", "*.*")],
+        )
+        if f:
+            self.patch_file.set(normalize_ui_path(f))
+
+    def _get_patch_path_and_strip_level(self) -> tuple[Path, int]:
+        patch_raw = normalize_ui_path(self.patch_file.get().strip())
+        if not patch_raw:
+            raise ValueError("Select a patch file.")
+        patch_path = Path(patch_raw).resolve()
+        if not patch_path.exists():
+            raise FileNotFoundError(f"Patch file does not exist: {patch_path}")
+        if not patch_path.is_file():
+            raise ValueError(f"Patch path is not a file: {patch_path}")
+
+        raw_level = (self.patch_strip_level.get() or "").strip()
+        try:
+            strip_level = int(raw_level)
+        except ValueError:
+            raise ValueError("Strip level must be an integer.")
+        if strip_level < 0:
+            raise ValueError("Strip level cannot be negative.")
+        return patch_path, strip_level
+
+    def _get_active_batch_patch_targets(self) -> list[tuple[str, Path]]:
+        selected = self._get_selected_batch_profiles()
+        targets: list[tuple[str, Path]] = []
+        for name in selected:
+            root, _out_path, _patterns, _exclude_dirs, _skip_binary, _header_full_path = self._read_profile_settings(name)
+            targets.append((name, root))
+        return targets
+
+    def _refresh_apply_patch_targets(self) -> None:
+        if not hasattr(self, "lbl_apply_patch_targets"):
+            return
+        try:
+            targets = self._get_active_batch_patch_targets()
+        except Exception as e:
+            self.lbl_apply_patch_targets.configure(text=f"Target read error: {e}")
+            return
+
+        if not targets:
+            self.lbl_apply_patch_targets.configure(text="No selected Batch profiles. Select target profiles in the Batch tab.")
+            return
+
+        lines = [f"{name}: {root}" for name, root in targets]
+        self.lbl_apply_patch_targets.configure(text="\n".join(lines))
+
+    def _apply_patch_to_active_batch(self, dry_run: bool) -> None:
+        try:
+            patch_path, strip_level = self._get_patch_path_and_strip_level()
+            targets = self._get_active_batch_patch_targets()
+            if not targets:
+                raise ValueError("Select at least one target profile in the Batch tab.")
+        except Exception as e:
+            messagebox.showerror("Apply Patch", str(e))
+            return
+
+        if not dry_run:
+            names = ", ".join(name for name, _root in targets)
+            if not messagebox.askyesno(
+                "Apply Patch",
+                f"Apply patch to {len(targets)} target(s)?\n\n{names}\n\nPatch: {patch_path}",
+            ):
+                return
+
+        ok_count = 0
+        err_count = 0
+        summaries: list[str] = []
+        action = "dry-run" if dry_run else "apply"
+        reverse = self.patch_reverse.get()
+
+        self._log(f"Patch {action} started: {patch_path} -> {len(targets)} target(s), -p{strip_level}, reverse={reverse}")
+
+        for name, root in targets:
+            try:
+                if not root.exists():
+                    raise FileNotFoundError(f"Project folder does not exist: {root}")
+
+                check_ok, check_output = run_git_apply_patch(
+                    root=root,
+                    patch_path=patch_path,
+                    strip_level=strip_level,
+                    reverse=reverse,
+                    check_only=True,
+                )
+                if not check_ok:
+                    raise RuntimeError(check_output)
+
+                backup_text = ""
+                if not dry_run and self.patch_backup.get():
+                    backup_dir, backed_up = create_patch_backup(root, patch_path, strip_level)
+                    if backup_dir:
+                        backup_text = f" backup={backup_dir} ({backed_up} file(s))"
+                    else:
+                        backup_text = " backup=none"
+
+                if not dry_run:
+                    apply_ok, apply_output = run_git_apply_patch(
+                        root=root,
+                        patch_path=patch_path,
+                        strip_level=strip_level,
+                        reverse=reverse,
+                        check_only=False,
+                    )
+                    if not apply_ok:
+                        raise RuntimeError(apply_output)
+
+                ok_count += 1
+                msg = f"[{name}] OK: {root}{backup_text}"
+                summaries.append(msg)
+                self._log(msg)
+            except Exception as e:
+                err_count += 1
+                msg = f"[{name}] ERROR: {e}"
+                summaries.append(msg)
+                self._log(msg)
+
+        status = f"Patch {action} completed. OK {ok_count}, errors {err_count}."
+        if summaries:
+            status += "\n" + "\n".join(summaries[-10:])
+        self.lbl_apply_patch_status.configure(text=status)
+
+        if err_count:
+            messagebox.showwarning("Apply Patch", status)
+        else:
+            messagebox.showinfo("Apply Patch", status)
 
 
     def _build_watch_tab(self, parent: ttk.Frame, pad: dict) -> None:
