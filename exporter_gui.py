@@ -16,6 +16,7 @@ import tempfile
 import webbrowser
 import shutil
 import subprocess
+import shlex
 from pathlib import Path
 from datetime import datetime
 
@@ -229,13 +230,130 @@ def _candidate_patch_roots(profile_root: Path) -> list[Path]:
     return _unique_existing_paths(candidates)
 
 
-def _candidate_strip_levels(preferred: int) -> list[int]:
-    levels = [preferred, 0, 1, 2, 3, 4]
+def _split_diff_git_paths(payload: str) -> list[str]:
+    try:
+        return shlex.split(payload, posix=True)
+    except Exception:
+        return payload.split()
+
+
+def collect_patch_raw_paths(patch_path: Path) -> tuple[str, ...]:
+    """Collect raw file paths referenced by a patch header.
+
+    The result is used only to rank and prune cwd/-p auto-detect attempts;
+    git apply --check remains the validation source of truth.
+    """
+    paths: list[str] = []
+    for line in read_text_safely(patch_path).splitlines():
+        if line.startswith("diff --git "):
+            parts = _split_diff_git_paths(line[len("diff --git "):].strip())
+            if len(parts) >= 2:
+                paths.extend(parts[:2])
+            continue
+        if line.startswith("--- ") or line.startswith("+++ "):
+            paths.append(line[4:].strip())
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        norm = _normalize_patch_raw_path(raw)
+        if not norm or norm == "/dev/null" or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return tuple(out)
+
+
+def collect_patch_side_raw_paths(patch_path: Path, *, side: str) -> tuple[str, ...]:
+    if side not in {"old", "new"}:
+        raise ValueError("side must be 'old' or 'new'")
+
+    prefix = "--- " if side == "old" else "+++ "
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in read_text_safely(patch_path).splitlines():
+        if not line.startswith(prefix):
+            continue
+        norm = _normalize_patch_raw_path(line[4:].strip())
+        if not norm or norm == "/dev/null" or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return tuple(out)
+
+
+def _patch_has_git_ab_prefix(raw_paths: tuple[str, ...]) -> bool:
+    for raw in raw_paths:
+        parts = [part for part in _normalize_patch_raw_path(raw).split("/") if part not in ("", ".")]
+        if parts and parts[0] in {"a", "b"}:
+            return True
+    return False
+
+
+def _strip_level_possible(raw_paths: tuple[str, ...], strip_level: int) -> bool:
+    if strip_level < 0:
+        return False
+    if not raw_paths:
+        return True
+    # git apply rejects a strip level if it removes every component from even
+    # one file header in the patch. Require all usable patch paths to survive.
+    return all(_strip_patch_path(raw, strip_level) is not None for raw in raw_paths)
+
+
+def _candidate_strip_levels(preferred: int, raw_paths: tuple[str, ...] | None = None) -> list[int]:
+    raw_paths = raw_paths or ()
+
+    levels: list[int] = []
+    # Standard git patches use a/... and b/... headers. For those, -p1 is the
+    # correct first probe regardless of a stale/manual value left in the field.
+    if _patch_has_git_ab_prefix(raw_paths):
+        levels.append(1)
+
+    levels.extend([preferred, 0, 1, 2, 3, 4, 5, 6])
+
     out: list[int] = []
     for level in levels:
-        if level >= 0 and level not in out:
+        if level >= 0 and level not in out and _strip_level_possible(raw_paths, level):
             out.append(level)
     return out
+
+
+def _rel_exists(root: Path, rel_posix: str) -> bool:
+    try:
+        return (root / Path(*rel_posix.split("/"))).exists()
+    except OSError:
+        return False
+
+
+def _rel_parent_exists(root: Path, rel_posix: str) -> bool:
+    try:
+        return (root / Path(*rel_posix.split("/"))).parent.exists()
+    except OSError:
+        return False
+
+
+def _score_patch_candidate(
+    *,
+    root: Path,
+    strip_level: int,
+    reference_raw_paths: tuple[str, ...],
+    all_raw_paths: tuple[str, ...],
+) -> int:
+    # Existing reference files are the strongest signal. Parent directories are
+    # weaker but useful for patches containing mostly new files.
+    existing_score = 0
+    for raw in reference_raw_paths:
+        rel = _strip_patch_path(raw, strip_level)
+        if rel and _rel_exists(root, rel):
+            existing_score += 1
+
+    parent_score = 0
+    for raw in all_raw_paths:
+        rel = _strip_patch_path(raw, strip_level)
+        if rel and _rel_parent_exists(root, rel):
+            parent_score += 1
+
+    return existing_score * 1000 + parent_score
 
 
 def _short_first_error(output: str, max_len: int = 220) -> str:
@@ -255,20 +373,47 @@ def detect_git_apply_plan(
     attempts: list[str] = []
     last_error = ""
 
-    for root in _candidate_patch_roots(profile_root):
-        for strip_level in _candidate_strip_levels(preferred_strip_level):
-            ok, output = run_git_apply_patch(
+    raw_paths = collect_patch_raw_paths(patch_path)
+    reference_raw_paths = collect_patch_side_raw_paths(patch_path, side="new" if reverse else "old")
+    if not reference_raw_paths:
+        reference_raw_paths = raw_paths
+
+    roots = _candidate_patch_roots(profile_root)
+    levels = _candidate_strip_levels(preferred_strip_level, raw_paths)
+
+    ranked: list[tuple[int, int, int, Path, int]] = []
+    for root_index, root in enumerate(roots):
+        for level_index, strip_level in enumerate(levels):
+            if not _strip_level_possible(raw_paths, strip_level):
+                continue
+            score = _score_patch_candidate(
                 root=root,
-                patch_path=patch_path,
                 strip_level=strip_level,
-                reverse=reverse,
-                check_only=True,
+                reference_raw_paths=reference_raw_paths,
+                all_raw_paths=raw_paths,
             )
-            marker = "OK" if ok else "FAIL"
-            attempts.append(f"{marker} cwd={root} -p{strip_level}: {_short_first_error(output)}")
-            if ok:
-                return PatchApplyPlan(root=root, strip_level=strip_level, check_output=output, attempts=tuple(attempts))
-            last_error = output
+            # Higher score first. root_index and level_index preserve stable fallback order.
+            ranked.append((-score, root_index, level_index, root, strip_level))
+
+    if not ranked:
+        raise RuntimeError("No valid strip level can be derived from this patch header.")
+
+    ranked.sort()
+
+    for neg_score, _root_index, _level_index, root, strip_level in ranked:
+        score = -neg_score
+        ok, output = run_git_apply_patch(
+            root=root,
+            patch_path=patch_path,
+            strip_level=strip_level,
+            reverse=reverse,
+            check_only=True,
+        )
+        marker = "OK" if ok else "FAIL"
+        attempts.append(f"{marker} cwd={root} -p{strip_level} score={score}: {_short_first_error(output)}")
+        if ok:
+            return PatchApplyPlan(root=root, strip_level=strip_level, check_output=output, attempts=tuple(attempts))
+        last_error = output
 
     detail = "\n".join(attempts[-12:])
     raise RuntimeError(
@@ -1939,7 +2084,7 @@ class DumpItApp(tk.Tk):
 
     # ---------- Apply Patch UI / Runner ----------
     def _build_apply_patch_tab(self, parent: ttk.Frame, pad: dict) -> None:
-        info = ttk.LabelFrame(parent, text="Apply patch — v5")
+        info = ttk.LabelFrame(parent, text="Apply patch — v6")
         info.pack(fill="both", expand=True, **pad)
 
         desc = ttk.Label(
@@ -1947,7 +2092,7 @@ class DumpItApp(tk.Tk):
             text=(
                 "Select one .patch/.diff file and one target folder. "
                 "This tab does not use Batch selection. Dry run uses git apply --check. "
-                "Auto-detect tries the target folder, parent folders, and -p levels."
+                "Auto-detect ranks cwd/-p candidates by patch headers and existing target files."
             ),
             wraplength=800,
             justify="left",
