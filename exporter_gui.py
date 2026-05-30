@@ -400,6 +400,11 @@ def detect_git_apply_plan(
 
     ranked.sort()
 
+    best_failed_score = -1
+    best_failed_root: Path | None = None
+    best_failed_strip_level: int | None = None
+    best_failed_output = ""
+
     for neg_score, _root_index, _level_index, root, strip_level in ranked:
         score = -neg_score
         ok, output = run_git_apply_patch(
@@ -414,8 +419,22 @@ def detect_git_apply_plan(
         if ok:
             return PatchApplyPlan(root=root, strip_level=strip_level, check_output=output, attempts=tuple(attempts))
         last_error = output
+        if score > best_failed_score:
+            best_failed_score = score
+            best_failed_root = root
+            best_failed_strip_level = strip_level
+            best_failed_output = output
 
     detail = "\n".join(attempts[-12:])
+    if best_failed_score > 0 and best_failed_root is not None and best_failed_strip_level is not None:
+        raise RuntimeError(
+            "Patch path resolved, but git apply --check failed. "
+            f"Best candidate: cwd={best_failed_root} -p{best_failed_strip_level} score={best_failed_score}. "
+            "This usually means the patch is stale, already partly applied, or the target files differ from the patch base. "
+            f"Last error: {_short_first_error(best_failed_output or last_error, 500)}"
+            + ("\nAttempts:\n" + detail if detail else "")
+        )
+
     raise RuntimeError(
         "No valid cwd/-p combination found. Last error: "
         f"{_short_first_error(last_error, 500)}"
@@ -1251,6 +1270,8 @@ class DumpItApp(tk.Tk):
         self._patch_drop_ref = None
 
         self._build_ui()
+        self.patch_target_dir.trace_add("write", lambda *_args: self._refresh_apply_patch_target())
+        self.patch_file.trace_add("write", lambda *_args: self._refresh_apply_patch_target())
         self._cleanup_diff_temp_html(log=True)
         self.after(250, self._enable_patch_file_drop)
 
@@ -2232,16 +2253,21 @@ class DumpItApp(tk.Tk):
         if not hasattr(self, "lbl_apply_patch_target"):
             return
         try:
+            target_raw = normalize_ui_path(self.patch_target_dir.get().strip())
             target = self._get_patch_target_dir()
-            self.lbl_apply_patch_target.configure(text=f"Target: {target}")
+            patch_raw = normalize_ui_path(self.patch_file.get().strip())
+            patch_text = f"\nPatch: {Path(patch_raw).name}" if patch_raw else ""
+            self.lbl_apply_patch_target.configure(text=f"Target field: {target_raw}\nResolved target: {target}{patch_text}")
         except Exception as e:
-            self.lbl_apply_patch_target.configure(text=f"Target error: {e}")
+            raw = normalize_ui_path(self.patch_target_dir.get().strip())
+            self.lbl_apply_patch_target.configure(text=f"Target field: {raw or '—'}\nTarget error: {e}")
 
     # Backward-compatible alias for older callbacks/config refresh paths.
     def _refresh_apply_patch_targets(self) -> None:
         self._refresh_apply_patch_target()
 
     def _apply_patch_to_target(self, dry_run: bool) -> None:
+        self._refresh_apply_patch_target()
         try:
             patch_path, strip_level = self._get_patch_path_and_strip_level()
             target = self._get_patch_target_dir()
