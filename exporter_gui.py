@@ -17,6 +17,7 @@ import webbrowser
 import shutil
 import subprocess
 import shlex
+import re
 from pathlib import Path
 from datetime import datetime
 
@@ -35,6 +36,9 @@ PROFILE_PREFIX = "profile:"  # es: profile:Default
 APP_BATCH_SELECTED_KEY = "batch_selected_profiles"  # csv list of profile names
 DIFF_TEMP_HTML_PREFIX = "dumpit_diff_"
 DIFF_TEMP_HTML_SUFFIX = ".html"
+TIMESTAMP_FORMAT = "%Y-%m-%d_%H%M%S"
+TIMESTAMP_STEM_RE = re.compile(r"^(?P<base>.+)_\d{4}-\d{2}-\d{2}_\d{6}$")
+DEFAULT_TIMESTAMP_KEEP_OLD = "10"
 
 
 def get_default_project_dir() -> Path:
@@ -618,11 +622,117 @@ def collect_files(root: Path, exclude_dirs: set[str], patterns: list[str], skip_
     return files
 
 
-def build_default_output(root: Path, add_ts: bool) -> Path:
-    name = root.name
+def strip_output_timestamp_from_stem(stem: str) -> str:
+    match = TIMESTAMP_STEM_RE.match(stem or "")
+    if match:
+        return match.group("base")
+    return stem
+
+
+def build_default_output(root: Path, add_ts: bool = False) -> Path:
+    path = root / f"{root.name}.txt"
     if add_ts:
-        name += "_" + datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    return root / f"{name}.txt"
+        return add_timestamp_to_output_path(path)
+    return path
+
+
+def get_output_base_path(path: Path) -> Path:
+    stem = strip_output_timestamp_from_stem(path.stem)
+    return path.with_name(f"{stem}{path.suffix}")
+
+
+def add_timestamp_to_output_path(path: Path, now: datetime | None = None) -> Path:
+    base = get_output_base_path(path)
+    ts = (now or datetime.now()).strftime(TIMESTAMP_FORMAT)
+    return base.with_name(f"{base.stem}_{ts}{base.suffix}")
+
+
+def resolve_export_output_path(root: Path, raw_output_file: str, add_timestamp: bool) -> Path:
+    raw_output_file = normalize_ui_path(raw_output_file or "")
+    base_path = Path(raw_output_file).resolve() if raw_output_file else build_default_output(root, False)
+    if add_timestamp:
+        return add_timestamp_to_output_path(base_path)
+    return base_path
+
+
+def timestamped_output_regex(base_path: Path) -> re.Pattern[str]:
+    base = get_output_base_path(base_path)
+    return re.compile(
+        r"^"
+        + re.escape(base.stem)
+        + r"_(?P<ts>\d{4}-\d{2}-\d{2}_\d{6})"
+        + re.escape(base.suffix)
+        + r"$"
+    )
+
+
+def collect_timestamped_output_files(path: Path) -> list[Path]:
+    base = get_output_base_path(path)
+    regex = timestamped_output_regex(base)
+    try:
+        children = list(base.parent.iterdir())
+    except OSError:
+        return []
+
+    files: list[Path] = []
+    for child in children:
+        try:
+            if child.is_file() and regex.match(child.name):
+                files.append(child)
+        except OSError:
+            continue
+    return files
+
+
+def build_output_exclude_files(out_path: Path, add_timestamp: bool) -> set[str]:
+    exclude_files = {canon_path(out_path)}
+    if add_timestamp:
+        base = get_output_base_path(out_path)
+        exclude_files.add(canon_path(base))
+        exclude_files.update(canon_path(path) for path in collect_timestamped_output_files(base))
+    return exclude_files
+
+
+def parse_timestamp_keep_old_value(raw: str, default: str = DEFAULT_TIMESTAMP_KEEP_OLD) -> int:
+    value = (raw or "").strip()
+    if not value:
+        value = default
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError("Max old timestamped exports to keep must be an integer.") from None
+    if parsed < 0:
+        raise ValueError("Max old timestamped exports to keep must be 0 or greater.")
+    return parsed
+
+
+def cleanup_old_timestamped_outputs(out_path: Path, keep_old_count: int) -> tuple[int, int]:
+    keep_old_count = max(0, int(keep_old_count))
+    regex = timestamped_output_regex(out_path)
+    candidates: list[tuple[str, int, Path]] = []
+
+    for path in collect_timestamped_output_files(out_path):
+        match = regex.match(path.name)
+        if not match:
+            continue
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = 0
+        candidates.append((match.group("ts"), mtime_ns, path))
+
+    # Keep the newest export plus N older timestamped exports.
+    candidates.sort(key=lambda item: (item[0], item[1], item[2].name.lower()), reverse=True)
+    keep_total = keep_old_count + 1
+    deleted = 0
+    failed = 0
+    for _ts, _mtime_ns, path in candidates[keep_total:]:
+        try:
+            path.unlink()
+            deleted += 1
+        except OSError:
+            failed += 1
+    return deleted, failed
 
 
 @dataclass(slots=True)
@@ -758,8 +868,13 @@ def export_to_file(
     skip_binary: bool,
     header_full_path: bool,
     profile_name: str = "Default",
+    exclude_files: Optional[Set[str]] = None,
 ) -> tuple[int, int]:
-    exclude_files = {canon_path(out_path)}
+    if exclude_files is None:
+        exclude_files = {canon_path(out_path)}
+    else:
+        exclude_files = set(exclude_files)
+        exclude_files.add(canon_path(out_path))
     entries, skipped = collect_export_entries(
         root=root,
         exclude_dirs=exclude_dirs,
@@ -1220,6 +1335,7 @@ class DumpItApp(tk.Tk):
         self.include_patterns = tk.StringVar(value=DEFAULT_INCLUDE)
         self.exclude_dirs = tk.StringVar(value=DEFAULT_EXCLUDE_DIRS)
         self.add_timestamp = tk.BooleanVar(value=False)
+        self.timestamp_keep_old = tk.StringVar(value=DEFAULT_TIMESTAMP_KEEP_OLD)
         self.skip_binary = tk.BooleanVar(value=True)
         self.header_full_path = tk.BooleanVar(value=False)
         self.output_file = tk.StringVar(value="")
@@ -1249,6 +1365,8 @@ class DumpItApp(tk.Tk):
         self._watch_exclude_dirs: set[str] = set()
         self._watch_skip_binary = True
         self._watch_header_full_path = False
+        self._watch_add_timestamp = False
+        self._watch_timestamp_keep_old = parse_timestamp_keep_old_value(DEFAULT_TIMESTAMP_KEEP_OLD)
         self._watch_poll_interval_ms = 1500
         self._watch_quiet_period_ms = 1200
         self._watch_last_change_summary = "No changes detected yet."
@@ -1382,8 +1500,10 @@ class DumpItApp(tk.Tk):
         ttk.Checkbutton(opt, text="Skip binary files (recommended)", variable=self.skip_binary).grid(
             row=0, column=1, sticky="w", padx=6, pady=2
         )
+        ttk.Label(opt, text="Max old timestamped exports to keep:").grid(row=1, column=0, sticky="w", padx=6, pady=2)
+        ttk.Entry(opt, textvariable=self.timestamp_keep_old, width=8).grid(row=1, column=1, sticky="w", padx=6, pady=2)
         ttk.Checkbutton(opt, text="Header = full path (instead of relative)", variable=self.header_full_path).grid(
-            row=1, column=0, sticky="w", padx=6, pady=2
+            row=2, column=0, sticky="w", padx=6, pady=2
         )
 
         # Actions
@@ -1432,7 +1552,7 @@ class DumpItApp(tk.Tk):
 
     def _choose_output(self) -> None:
         root = Path(normalize_ui_path(self.project_dir.get())).resolve()
-        initial = build_default_output(root, self.add_timestamp.get())
+        initial = build_default_output(root, False)
         f = filedialog.asksaveasfilename(
             title="Choose output file",
             initialdir=str(root),
@@ -1446,18 +1566,18 @@ class DumpItApp(tk.Tk):
     def _ensure_output_default(self) -> None:
         if not self.output_file.get().strip():
             root = Path(normalize_ui_path(self.project_dir.get())).resolve()
-            self.output_file.set(normalize_ui_path(str(build_default_output(root, self.add_timestamp.get()))))
+            self.output_file.set(normalize_ui_path(str(build_default_output(root, False))))
 
     def _suggest_output_if_default(self) -> None:
         try:
             root = Path(normalize_ui_path(self.project_dir.get())).resolve()
             current = self.output_file.get().strip()
             if not current:
-                self.output_file.set(normalize_ui_path(str(build_default_output(root, self.add_timestamp.get()))))
+                self.output_file.set(normalize_ui_path(str(build_default_output(root, False))))
                 return
             curp = Path(current).resolve()
             if curp.parent == root and curp.stem.startswith(root.name):
-                self.output_file.set(normalize_ui_path(str(build_default_output(root, self.add_timestamp.get()))))
+                self.output_file.set(normalize_ui_path(str(build_default_output(root, False))))
         except Exception:
             pass
 
@@ -1472,8 +1592,8 @@ class DumpItApp(tk.Tk):
             patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
             exclude = {x.lower() for x in parse_csv_list(self.exclude_dirs.get())}
             out = normalize_ui_path(self.output_file.get().strip())
-            out_path = Path(out).resolve() if out else None
-            exclude_files = {canon_path(out_path)} if out_path else set()
+            out_path = resolve_export_output_path(root, out, self.add_timestamp.get())
+            exclude_files = build_output_exclude_files(out_path, self.add_timestamp.get())
             files = collect_files(root, exclude, patterns, self.skip_binary.get(), exclude_files=exclude_files)
             self._log(f"Preview: {len(files)} files will be included from: {root}")
         except Exception as e:
@@ -1481,30 +1601,7 @@ class DumpItApp(tk.Tk):
 
     def _export(self) -> None:
         try:
-            root = Path(normalize_ui_path(self.project_dir.get())).resolve()
-            if not root.exists():
-                messagebox.showerror("Error", "Project folder does not exist.")
-                return
-
-            patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
-            exclude = {x.lower() for x in parse_csv_list(self.exclude_dirs.get())}
-
-            out = normalize_ui_path(self.output_file.get().strip())
-            out_path = Path(out).resolve() if out else build_default_output(root, self.add_timestamp.get())
-
-            included, skipped = export_to_file(
-                root=root,
-                out_path=out_path,
-                exclude_dirs=exclude,
-                patterns=patterns,
-                skip_binary=self.skip_binary.get(),
-                header_full_path=self.header_full_path.get(),
-                profile_name=(self.profile_name.get().strip() or "Default"),
-            )
-
-            self._save_config(silent=True)
-            self._log(f"OK: exported {included} files -> {out_path} (skipped read errors: {skipped})")
-            messagebox.showinfo("Done", f"Export completed.\nIncluded: {included}\nSkipped read errors: {skipped}\nOutput: {out_path}")
+            self._run_export(show_message=True)
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
@@ -1623,6 +1720,7 @@ class DumpItApp(tk.Tk):
                 "include_patterns": DEFAULT_INCLUDE,
                 "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
                 "add_timestamp": "False",
+                "timestamp_keep_old": DEFAULT_TIMESTAMP_KEEP_OLD,
                 "skip_binary": "True",
                 "header_full_path": "False",
                 "watch_poll_ms": "1500",
@@ -1679,6 +1777,7 @@ class DumpItApp(tk.Tk):
                 "include_patterns": DEFAULT_INCLUDE,
                 "exclude_dirs": DEFAULT_EXCLUDE_DIRS,
                 "add_timestamp": "False",
+                "timestamp_keep_old": DEFAULT_TIMESTAMP_KEEP_OLD,
                 "skip_binary": "True",
                 "header_full_path": "False",
                 "watch_poll_ms": "1500",
@@ -1695,6 +1794,7 @@ class DumpItApp(tk.Tk):
             self.include_patterns.set(s.get("include_patterns", DEFAULT_INCLUDE))
             self.exclude_dirs.set(s.get("exclude_dirs", DEFAULT_EXCLUDE_DIRS))
             self.add_timestamp.set(s.getboolean("add_timestamp", fallback=False))
+            self.timestamp_keep_old.set(s.get("timestamp_keep_old", DEFAULT_TIMESTAMP_KEEP_OLD))
             self.skip_binary.set(s.getboolean("skip_binary", fallback=True))
             self.header_full_path.set(s.getboolean("header_full_path", fallback=False))
 
@@ -1721,6 +1821,7 @@ class DumpItApp(tk.Tk):
         self._cp[sec_real]["include_patterns"] = self.include_patterns.get()
         self._cp[sec_real]["exclude_dirs"] = self.exclude_dirs.get()
         self._cp[sec_real]["add_timestamp"] = str(self.add_timestamp.get())
+        self._cp[sec_real]["timestamp_keep_old"] = self.timestamp_keep_old.get().strip() or DEFAULT_TIMESTAMP_KEEP_OLD
         self._cp[sec_real]["skip_binary"] = str(self.skip_binary.get())
         self._cp[sec_real]["header_full_path"] = str(self.header_full_path.get())
         self._cp[sec_real]["watch_poll_ms"] = self.watch_poll_ms.get().strip()
@@ -1895,6 +1996,7 @@ class DumpItApp(tk.Tk):
         self.include_patterns.set(DEFAULT_INCLUDE)
         self.exclude_dirs.set(DEFAULT_EXCLUDE_DIRS)
         self.add_timestamp.set(False)
+        self.timestamp_keep_old.set(DEFAULT_TIMESTAMP_KEEP_OLD)
         self.skip_binary.set(True)
         self.header_full_path.set(False)
         self.output_file.set("")
@@ -2423,16 +2525,23 @@ class DumpItApp(tk.Tk):
             raise ValueError(f"{label} must be at least {minimum} ms.")
         return parsed
 
-    def _get_current_ui_export_settings(self) -> tuple[Path, Path, list[str], set[str], bool, bool]:
+    def _parse_timestamp_keep_old(self) -> int:
+        keep_old = parse_timestamp_keep_old_value(self.timestamp_keep_old.get())
+        self.timestamp_keep_old.set(str(keep_old))
+        return keep_old
+
+    def _get_current_ui_export_settings(self) -> tuple[Path, Path, list[str], set[str], bool, bool, bool, int]:
         root = Path(normalize_ui_path(self.project_dir.get())).resolve()
         if not root.exists():
             raise FileNotFoundError("Project folder does not exist.")
 
         patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
         exclude_dirs = {x.lower() for x in parse_csv_list(self.exclude_dirs.get())}
+        add_timestamp = self.add_timestamp.get()
+        keep_old = self._parse_timestamp_keep_old()
         out = normalize_ui_path(self.output_file.get().strip())
-        out_path = Path(out).resolve() if out else build_default_output(root, self.add_timestamp.get())
-        return root, out_path, patterns, exclude_dirs, self.skip_binary.get(), self.header_full_path.get()
+        out_path = resolve_export_output_path(root, out, add_timestamp)
+        return root, out_path, patterns, exclude_dirs, self.skip_binary.get(), self.header_full_path.get(), add_timestamp, keep_old
 
     def _file_digest(self, p: Path) -> str:
         h = hashlib.sha1()
@@ -2449,7 +2558,7 @@ class DumpItApp(tk.Tk):
         if self._watch_root is None or self._watch_out_path is None:
             return {}
     
-        exclude_files = {canon_path(self._watch_out_path)}
+        exclude_files = build_output_exclude_files(self._watch_out_path, self._watch_add_timestamp)
         files = collect_files(
             self._watch_root,
             self._watch_exclude_dirs,
@@ -2505,7 +2614,7 @@ class DumpItApp(tk.Tk):
         try:
             poll_ms = self._watch_validate_ms(self.watch_poll_ms.get(), "Poll interval", 1500)
             quiet_ms = self._watch_validate_ms(self.watch_quiet_ms.get(), "Quiet time before export", 1200)
-            root, out_path, patterns, exclude_dirs, skip_binary, header_full_path = self._get_current_ui_export_settings()
+            root, out_path, patterns, exclude_dirs, skip_binary, header_full_path, add_timestamp, keep_old = self._get_current_ui_export_settings()
         except Exception as e:
             messagebox.showerror("Watch", str(e))
             return
@@ -2522,6 +2631,8 @@ class DumpItApp(tk.Tk):
         self._watch_exclude_dirs = set(exclude_dirs)
         self._watch_skip_binary = skip_binary
         self._watch_header_full_path = header_full_path
+        self._watch_add_timestamp = add_timestamp
+        self._watch_timestamp_keep_old = keep_old
         self._watch_poll_interval_ms = poll_ms
         self._watch_quiet_period_ms = quiet_ms
         self._watch_snapshot = self._build_watch_snapshot()
@@ -2564,6 +2675,8 @@ class DumpItApp(tk.Tk):
         self._watch_patterns = []
         self._watch_exclude_dirs = set()
         self._watch_snapshot = {}
+        self._watch_add_timestamp = False
+        self._watch_timestamp_keep_old = parse_timestamp_keep_old_value(DEFAULT_TIMESTAMP_KEEP_OLD)
         self._watch_poll_interval_ms = 1500
         self._watch_quiet_period_ms = 1200
         self._set_watch_status("Stopped")
@@ -2643,9 +2756,12 @@ class DumpItApp(tk.Tk):
 
         patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
         exclude = {x.lower() for x in parse_csv_list(self.exclude_dirs.get())}
+        add_timestamp = self.add_timestamp.get()
+        keep_old = self._parse_timestamp_keep_old()
 
         out = normalize_ui_path(self.output_file.get().strip())
-        out_path = Path(out).resolve() if out else build_default_output(root, self.add_timestamp.get())
+        out_path = resolve_export_output_path(root, out, add_timestamp)
+        exclude_files = build_output_exclude_files(out_path, add_timestamp)
 
         included, skipped = export_to_file(
             root=root,
@@ -2655,14 +2771,28 @@ class DumpItApp(tk.Tk):
             skip_binary=self.skip_binary.get(),
             header_full_path=self.header_full_path.get(),
             profile_name=(self.profile_name.get().strip() or "Default"),
+            exclude_files=exclude_files,
         )
 
+        deleted_old = 0
+        failed_delete = 0
+        if add_timestamp:
+            deleted_old, failed_delete = cleanup_old_timestamped_outputs(out_path, keep_old)
+
         self._save_config(silent=True)
-        self._log(f"OK: exported {included} files -> {out_path} (skipped read errors: {skipped})")
+        cleanup_msg = ""
+        if add_timestamp and (deleted_old or failed_delete):
+            cleanup_msg = f"; timestamp cleanup deleted {deleted_old}, failed {failed_delete}"
+        self._log(f"OK: exported {included} files -> {out_path} (skipped read errors: {skipped}{cleanup_msg})")
         if show_message:
+            extra = ""
+            if add_timestamp:
+                extra = f"\nOld timestamped exports deleted: {deleted_old}"
+                if failed_delete:
+                    extra += f"\nOld timestamped exports failed to delete: {failed_delete}"
             messagebox.showinfo(
                 "Done",
-                f"Export completed.\nIncluded: {included}\nSkipped read errors: {skipped}\nOutput: {out_path}",
+                f"Export completed.\nIncluded: {included}\nSkipped read errors: {skipped}{extra}\nOutput: {out_path}",
             )
         return included, skipped, out_path
 
@@ -2824,13 +2954,14 @@ class DumpItApp(tk.Tk):
         exclude_dirs = {x.lower() for x in parse_csv_list(s.get("exclude_dirs", DEFAULT_EXCLUDE_DIRS))}
 
         add_timestamp = s.getboolean("add_timestamp", fallback=False)
+        keep_old = parse_timestamp_keep_old_value(s.get("timestamp_keep_old", DEFAULT_TIMESTAMP_KEEP_OLD))
         skip_binary = s.getboolean("skip_binary", fallback=True)
         header_full_path = s.getboolean("header_full_path", fallback=False)
 
         out_str = normalize_ui_path(s.get("output_file", "").strip())
-        out_path = Path(out_str).resolve() if out_str else build_default_output(root, add_timestamp)
+        out_path = resolve_export_output_path(root, out_str, add_timestamp)
 
-        return root, out_path, include_patterns, exclude_dirs, skip_binary, header_full_path
+        return root, out_path, include_patterns, exclude_dirs, skip_binary, header_full_path, add_timestamp, keep_old
 
     def _set_batch_running(self, running: bool) -> None:
         try:
@@ -2878,12 +3009,12 @@ class DumpItApp(tk.Tk):
         self.lbl_batch_status.configure(text=f"Running {self._batch_mode}: {done}/{done + len(self._batch_queue)}")
 
         try:
-            root, out_path, patterns, exclude_dirs, skip_binary, header_full_path = self._read_profile_settings(name)
+            root, out_path, patterns, exclude_dirs, skip_binary, header_full_path, add_timestamp, keep_old = self._read_profile_settings(name)
             if not root.exists():
                 raise FileNotFoundError(f"Project folder does not exist: {root}")
 
             if self._batch_mode == "preview":
-                exclude_files = {canon_path(out_path)}
+                exclude_files = build_output_exclude_files(out_path, add_timestamp)
                 files = collect_files(root, exclude_dirs, patterns, skip_binary, exclude_files=exclude_files)
                 self._log(f"[{name}] Preview: {len(files)} files from: {root}")
             else:
@@ -2895,8 +3026,14 @@ class DumpItApp(tk.Tk):
                     skip_binary=skip_binary,
                     header_full_path=header_full_path,
                     profile_name=name,
+                    exclude_files=build_output_exclude_files(out_path, add_timestamp),
                 )
-                self._log(f"[{name}] OK: exported {included} files -> {out_path} (skipped read errors: {skipped})")
+                cleanup_msg = ""
+                if add_timestamp:
+                    deleted_old, failed_delete = cleanup_old_timestamped_outputs(out_path, keep_old)
+                    if deleted_old or failed_delete:
+                        cleanup_msg = f"; timestamp cleanup deleted {deleted_old}, failed {failed_delete}"
+                self._log(f"[{name}] OK: exported {included} files -> {out_path} (skipped read errors: {skipped}{cleanup_msg})")
 
             self._batch_results.append((name, "OK"))
         except Exception as e:
