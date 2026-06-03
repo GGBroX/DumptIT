@@ -1661,6 +1661,16 @@ class DumpItApp(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def _copy_full_log_to_clipboard(self) -> None:
+        if not hasattr(self, "log"):
+            return
+        text = self.log.get("1.0", "end-1c")
+        if not text.strip():
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._log("Log copied to clipboard.")
+
     # ---------- Project / Output ----------
     def _browse_project(self) -> None:
         d = filedialog.askdirectory(title="Select project folder", initialdir=self.project_dir.get() or str(get_default_project_dir()))
@@ -2367,7 +2377,7 @@ class DumpItApp(tk.Tk):
                 "Select one .patch/.diff file and one target folder. "
                 "This tab does not use Batch selection. Dry run uses git apply --check. "
                 "Preview changes opens a visual before/after diff without touching the target. "
-                "Auto-detect ranks cwd/-p candidates by patch headers and existing target files."
+                "Results are written to the shared log below."
             ),
             wraplength=800,
             justify="left",
@@ -2409,20 +2419,8 @@ class DumpItApp(tk.Tk):
         ttk.Button(actions, text="Preview changes", command=self._preview_patch_changes).pack(side="left", padx=4)
         ttk.Button(actions, text="Dry run", command=lambda: self._apply_patch_to_target(dry_run=True)).pack(side="left", padx=4)
         ttk.Button(actions, text="Apply", command=lambda: self._apply_patch_to_target(dry_run=False)).pack(side="left", padx=4)
-
-        details = ttk.LabelFrame(info, text="Status")
-        details.pack(fill="both", expand=True, padx=8, pady=(6, 10))
-        status_actions = ttk.Frame(details)
-        status_actions.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Button(status_actions, text="Copy status", command=self._copy_apply_patch_status).pack(side="right")
-        status_frame = ttk.Frame(details)
-        status_frame.pack(fill="both", expand=True, padx=8, pady=8)
-        self.txt_apply_patch_status = tk.Text(status_frame, height=8, wrap="word", undo=False)
-        self.txt_apply_patch_status.pack(side="left", fill="both", expand=True)
-        status_scroll = ttk.Scrollbar(status_frame, orient="vertical", command=self.txt_apply_patch_status.yview)
-        status_scroll.pack(side="right", fill="y")
-        self.txt_apply_patch_status.configure(yscrollcommand=status_scroll.set, state="disabled")
-        self._set_apply_patch_status("No patch checked.")
+        ttk.Button(actions, text="Copy log", command=self._copy_full_log_to_clipboard).pack(side="left", padx=12)
+        self._apply_patch_status_text = "No patch checked."
 
         self._refresh_apply_patch_target()
 
@@ -2568,19 +2566,10 @@ class DumpItApp(tk.Tk):
 
     def _set_apply_patch_status(self, text: str) -> None:
         self._apply_patch_status_text = text or ""
-        widget = getattr(self, "txt_apply_patch_status", None)
-        if widget is None:
-            return
-        widget.configure(state="normal")
-        widget.delete("1.0", "end")
-        widget.insert("1.0", self._apply_patch_status_text)
-        widget.configure(state="disabled")
-        widget.see("1.0")
 
     def _copy_apply_patch_status(self) -> None:
+        # Compatibility helper for older bindings; the Apply Patch tab now exposes Copy log.
         text = getattr(self, "_apply_patch_status_text", "") or ""
-        if not text and hasattr(self, "txt_apply_patch_status"):
-            text = self.txt_apply_patch_status.get("1.0", "end-1c")
         if not text:
             return
         self.clipboard_clear()
