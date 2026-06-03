@@ -1497,7 +1497,7 @@ class DumpItApp(tk.Tk):
 
         # Apply Patch state
         self.patch_file = tk.StringVar(value="")
-        self.patch_target_dir = tk.StringVar(value=str(get_default_project_dir()))
+        self.patch_target_dir = tk.StringVar(value="")
         self.patch_strip_level = tk.StringVar(value="1")
         self.patch_reverse = tk.BooleanVar(value=False)
         self.patch_backup = tk.BooleanVar(value=True)
@@ -1514,7 +1514,8 @@ class DumpItApp(tk.Tk):
         self._load_config()
         self._loading_config = False
         self._ensure_output_default()
-        self.patch_target_dir.set(normalize_ui_path(self.project_dir.get()))
+        if not self.patch_target_dir.get().strip():
+            self.patch_target_dir.set(normalize_ui_path(self.project_dir.get()))
 
         self.after(0, self._apply_dynamic_min_size)
 
@@ -1843,6 +1844,12 @@ class DumpItApp(tk.Tk):
                 "watch_poll_ms": "1500",
                 "watch_quiet_ms": "1200",
                 "watch_export_on_start": "True",
+                "patch_file": "",
+                "patch_target_dir": "",
+                "patch_strip_level": "1",
+                "patch_reverse": "False",
+                "patch_backup": "True",
+                "patch_auto_detect": "True",
             }
 
     # ---------- Batch selection persistence ----------
@@ -1900,6 +1907,12 @@ class DumpItApp(tk.Tk):
                 "watch_poll_ms": "1500",
                 "watch_quiet_ms": "1200",
                 "watch_export_on_start": "True",
+                "patch_file": "",
+                "patch_target_dir": "",
+                "patch_strip_level": "1",
+                "patch_reverse": "False",
+                "patch_backup": "True",
+                "patch_auto_detect": "True",
             }
 
         s = self._cp[sec_real]
@@ -1919,6 +1932,14 @@ class DumpItApp(tk.Tk):
             self.watch_poll_ms.set(s.get("watch_poll_ms", "1500"))
             self.watch_quiet_ms.set(s.get("watch_quiet_ms", "1200"))
             self.watch_export_on_start.set(s.getboolean("watch_export_on_start", fallback=True))
+
+            self.patch_file.set(normalize_ui_path(s.get("patch_file", "")))
+            patch_target = normalize_ui_path(s.get("patch_target_dir", ""))
+            self.patch_target_dir.set(patch_target or normalize_ui_path(self.project_dir.get()))
+            self.patch_strip_level.set(s.get("patch_strip_level", "1"))
+            self.patch_reverse.set(s.getboolean("patch_reverse", fallback=False))
+            self.patch_backup.set(s.getboolean("patch_backup", fallback=True))
+            self.patch_auto_detect.set(s.getboolean("patch_auto_detect", fallback=True))
 
             # Se il profilo non ha output_file, calcolane uno di default per quella project_dir
             self._ensure_output_default()
@@ -1944,6 +1965,13 @@ class DumpItApp(tk.Tk):
         self._cp[sec_real]["watch_poll_ms"] = self.watch_poll_ms.get().strip()
         self._cp[sec_real]["watch_quiet_ms"] = self.watch_quiet_ms.get().strip()
         self._cp[sec_real]["watch_export_on_start"] = str(self.watch_export_on_start.get())
+
+        self._cp[sec_real]["patch_file"] = normalize_ui_path(self.patch_file.get())
+        self._cp[sec_real]["patch_target_dir"] = normalize_ui_path(self.patch_target_dir.get())
+        self._cp[sec_real]["patch_strip_level"] = (self.patch_strip_level.get() or "1").strip() or "1"
+        self._cp[sec_real]["patch_reverse"] = str(self.patch_reverse.get())
+        self._cp[sec_real]["patch_backup"] = str(self.patch_backup.get())
+        self._cp[sec_real]["patch_auto_detect"] = str(self.patch_auto_detect.get())
 
     def _load_config(self) -> None:
         # carica ini
@@ -2120,6 +2148,12 @@ class DumpItApp(tk.Tk):
         self.watch_poll_ms.set("1500")
         self.watch_quiet_ms.set("1200")
         self.watch_export_on_start.set(True)
+        self.patch_file.set("")
+        self.patch_target_dir.set(normalize_ui_path(self.project_dir.get()))
+        self.patch_strip_level.set("1")
+        self.patch_reverse.set(False)
+        self.patch_backup.set(True)
+        self.patch_auto_detect.set(True)
         self._ensure_output_default()
         self._log("Reset to defaults (not saved yet).")
 
@@ -2378,8 +2412,17 @@ class DumpItApp(tk.Tk):
 
         details = ttk.LabelFrame(info, text="Status")
         details.pack(fill="both", expand=True, padx=8, pady=(6, 10))
-        self.lbl_apply_patch_status = ttk.Label(details, text="No patch checked.", wraplength=800, justify="left")
-        self.lbl_apply_patch_status.pack(fill="x", padx=8, pady=8)
+        status_actions = ttk.Frame(details)
+        status_actions.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Button(status_actions, text="Copy status", command=self._copy_apply_patch_status).pack(side="right")
+        status_frame = ttk.Frame(details)
+        status_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        self.txt_apply_patch_status = tk.Text(status_frame, height=8, wrap="word", undo=False)
+        self.txt_apply_patch_status.pack(side="left", fill="both", expand=True)
+        status_scroll = ttk.Scrollbar(status_frame, orient="vertical", command=self.txt_apply_patch_status.yview)
+        status_scroll.pack(side="right", fill="y")
+        self.txt_apply_patch_status.configure(yscrollcommand=status_scroll.set, state="disabled")
+        self._set_apply_patch_status("No patch checked.")
 
         self._refresh_apply_patch_target()
 
@@ -2523,6 +2566,27 @@ class DumpItApp(tk.Tk):
         self._log(f"{log_label} HTML opened: {out_path}")
         return out_path
 
+    def _set_apply_patch_status(self, text: str) -> None:
+        self._apply_patch_status_text = text or ""
+        widget = getattr(self, "txt_apply_patch_status", None)
+        if widget is None:
+            return
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", self._apply_patch_status_text)
+        widget.configure(state="disabled")
+        widget.see("1.0")
+
+    def _copy_apply_patch_status(self) -> None:
+        text = getattr(self, "_apply_patch_status_text", "") or ""
+        if not text and hasattr(self, "txt_apply_patch_status"):
+            text = self.txt_apply_patch_status.get("1.0", "end-1c")
+        if not text:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._log("Apply Patch status copied to clipboard.")
+
     def _preview_patch_changes(self) -> None:
         self._refresh_apply_patch_target()
         try:
@@ -2550,11 +2614,11 @@ class DumpItApp(tk.Tk):
                 f"modified {len(diff.modified)}, unchanged {len(diff.unchanged)}. "
                 f"HTML: {out_path}"
             )
-            self.lbl_apply_patch_status.configure(text=status)
+            self._set_apply_patch_status(status)
             self._log(status)
         except Exception as e:
             status = f"Patch preview failed. ERROR: {e}"
-            self.lbl_apply_patch_status.configure(text=status)
+            self._set_apply_patch_status(status)
             self._log(status)
             messagebox.showerror("Patch Preview", status)
 
@@ -2630,12 +2694,12 @@ class DumpItApp(tk.Tk):
                     raise RuntimeError(apply_output)
 
             status = f"Patch {action} completed. OK. cwd={effective_root}, -p{effective_strip}{backup_text}"
-            self.lbl_apply_patch_status.configure(text=status)
+            self._set_apply_patch_status(status)
             self._log(status)
             messagebox.showinfo("Apply Patch", status)
         except Exception as e:
             status = f"Patch {action} failed. ERROR: {e}"
-            self.lbl_apply_patch_status.configure(text=status)
+            self._set_apply_patch_status(status)
             self._log(status)
             messagebox.showerror("Apply Patch", status)
 
