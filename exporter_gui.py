@@ -164,6 +164,123 @@ def create_patch_backup(root: Path, patch_path: Path, strip_level: int) -> tuple
     return backup_root, len(existing)
 
 
+def _patch_rel_path(root: Path, rel_posix: str) -> Path:
+    return root / Path(*rel_posix.split("/"))
+
+
+def _collect_patch_preview_rel_paths(patch_path: Path, strip_level: int) -> tuple[str, ...]:
+    """Return all relative paths needed to preview a patch application.
+
+    Both old and new side paths are included so rename/delete/create hunks can be
+    represented in the before/after visual diff.
+    """
+    paths: set[str] = set()
+    old_path: str | None = None
+
+    for line in read_text_safely(patch_path).splitlines():
+        if line.startswith("--- "):
+            old_path = line[4:].strip()
+            continue
+        if line.startswith("+++ "):
+            new_path = line[4:].strip()
+            for raw in (old_path, new_path):
+                rel = _strip_patch_path(raw or "", strip_level)
+                if rel:
+                    paths.add(rel)
+            old_path = None
+
+    # Fallback for unusual patches that expose only diff --git headers or mode changes.
+    if not paths:
+        for raw in collect_patch_raw_paths(patch_path):
+            rel = _strip_patch_path(raw, strip_level)
+            if rel:
+                paths.add(rel)
+
+    return tuple(sorted(paths, key=str.lower))
+
+
+def _read_file_for_patch_preview(path: Path) -> str:
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(str(path))
+
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = -1
+
+    if is_probably_binary(path):
+        digest = "unknown"
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            pass
+        return f"[[BINARY FILE | size={size} | sha256={digest}]]\n"
+
+    return read_text_safely(path)
+
+
+def _read_patch_preview_snapshot(root: Path, rel_paths: tuple[str, ...]) -> dict[str, str]:
+    files: dict[str, str] = {}
+    for rel in rel_paths:
+        path = _patch_rel_path(root, rel)
+        try:
+            if path.is_file():
+                files[rel] = _read_file_for_patch_preview(path)
+        except OSError:
+            continue
+    return files
+
+
+def _prepare_patch_preview_temp_root(root: Path, rel_paths: tuple[str, ...], temp_root: Path) -> None:
+    for rel in rel_paths:
+        src = _patch_rel_path(root, rel)
+        dst = _patch_rel_path(temp_root, rel)
+        ensure_parent_dir(dst)
+        if src.is_file():
+            shutil.copy2(src, dst)
+
+
+def build_patch_preview_diff(
+    *,
+    root: Path,
+    patch_path: Path,
+    strip_level: int,
+    reverse: bool,
+) -> DumpDiffResult:
+    """Build a before/after visual diff for a patch without touching the target root."""
+    rel_paths = _collect_patch_preview_rel_paths(patch_path, strip_level)
+    if not rel_paths:
+        raise ValueError("No file paths were found in this patch.")
+
+    before_files = _read_patch_preview_snapshot(root, rel_paths)
+
+    with tempfile.TemporaryDirectory(prefix="dumpit_patch_preview_") as tmp:
+        temp_root = Path(tmp).resolve()
+        _prepare_patch_preview_temp_root(root, rel_paths, temp_root)
+
+        ok, output = run_git_apply_patch(
+            root=temp_root,
+            patch_path=patch_path,
+            strip_level=strip_level,
+            reverse=reverse,
+            check_only=False,
+        )
+        if not ok:
+            raise RuntimeError(output)
+
+        after_files = _read_patch_preview_snapshot(temp_root, rel_paths)
+
+    before = DumpSnapshot(
+        source=root / f"__patch_preview_before__{patch_path.name}",
+        files=before_files,
+    )
+    after = DumpSnapshot(
+        source=root / f"__patch_preview_after__{patch_path.name}",
+        files=after_files,
+    )
+    return compare_dump_snapshots(before, after)
+
+
 def run_git_apply_patch(
     *,
     root: Path,
@@ -2215,6 +2332,7 @@ class DumpItApp(tk.Tk):
             text=(
                 "Select one .patch/.diff file and one target folder. "
                 "This tab does not use Batch selection. Dry run uses git apply --check. "
+                "Preview changes opens a visual before/after diff without touching the target. "
                 "Auto-detect ranks cwd/-p candidates by patch headers and existing target files."
             ),
             wraplength=800,
@@ -2254,6 +2372,7 @@ class DumpItApp(tk.Tk):
 
         actions = ttk.Frame(info)
         actions.pack(fill="x", padx=8, pady=6)
+        ttk.Button(actions, text="Preview changes", command=self._preview_patch_changes).pack(side="left", padx=4)
         ttk.Button(actions, text="Dry run", command=lambda: self._apply_patch_to_target(dry_run=True)).pack(side="left", padx=4)
         ttk.Button(actions, text="Apply", command=lambda: self._apply_patch_to_target(dry_run=False)).pack(side="left", padx=4)
 
@@ -2367,6 +2486,77 @@ class DumpItApp(tk.Tk):
     # Backward-compatible alias for older callbacks/config refresh paths.
     def _refresh_apply_patch_targets(self) -> None:
         self._refresh_apply_patch_target()
+
+    def _resolve_patch_apply_plan_for_current_ui(self) -> tuple[Path, Path, int, tuple[str, ...]]:
+        patch_path, strip_level = self._get_patch_path_and_strip_level()
+        target = self._get_patch_target_dir()
+        reverse = self.patch_reverse.get()
+
+        if self.patch_auto_detect.get():
+            plan = detect_git_apply_plan(
+                profile_root=target,
+                patch_path=patch_path,
+                preferred_strip_level=strip_level,
+                reverse=reverse,
+            )
+            return patch_path, plan.root, plan.strip_level, plan.attempts
+
+        check_ok, check_output = run_git_apply_patch(
+            root=target,
+            patch_path=patch_path,
+            strip_level=strip_level,
+            reverse=reverse,
+            check_only=True,
+        )
+        if not check_ok:
+            raise RuntimeError(check_output)
+        return patch_path, target, strip_level, ()
+
+    def _open_delta_html_result(self, diff: DumpDiffResult, *, log_label: str) -> Path:
+        self._cleanup_diff_temp_html(log=True)
+        html = build_delta_html(diff)
+        out_dir = get_diff_temp_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{DIFF_TEMP_HTML_PREFIX}{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{DIFF_TEMP_HTML_SUFFIX}"
+        out_path.write_text(html, encoding="utf-8")
+        webbrowser.open(out_path.as_uri())
+        self._log(f"{log_label} HTML opened: {out_path}")
+        return out_path
+
+    def _preview_patch_changes(self) -> None:
+        self._refresh_apply_patch_target()
+        try:
+            patch_path, effective_root, effective_strip, attempts = self._resolve_patch_apply_plan_for_current_ui()
+            reverse = self.patch_reverse.get()
+
+            self._log(
+                f"Patch preview started: {patch_path} -> target={effective_root}, "
+                f"-p{effective_strip}, reverse={reverse}"
+            )
+            for attempt in attempts:
+                self._log(f"[Apply Patch Preview]   {attempt}")
+
+            diff = build_patch_preview_diff(
+                root=effective_root,
+                patch_path=patch_path,
+                strip_level=effective_strip,
+                reverse=reverse,
+            )
+
+            out_path = self._open_delta_html_result(diff, log_label="Patch preview")
+            status = (
+                f"Patch preview opened. cwd={effective_root}, -p{effective_strip}. "
+                f"Added {len(diff.added)}, removed {len(diff.removed)}, "
+                f"modified {len(diff.modified)}, unchanged {len(diff.unchanged)}. "
+                f"HTML: {out_path}"
+            )
+            self.lbl_apply_patch_status.configure(text=status)
+            self._log(status)
+        except Exception as e:
+            status = f"Patch preview failed. ERROR: {e}"
+            self.lbl_apply_patch_status.configure(text=status)
+            self._log(status)
+            messagebox.showerror("Patch Preview", status)
 
     def _apply_patch_to_target(self, dry_run: bool) -> None:
         self._refresh_apply_patch_target()
