@@ -9,6 +9,7 @@ import sys
 import platform
 import fnmatch
 import configparser
+import ast
 import hashlib
 import difflib
 import html as html_lib
@@ -39,6 +40,10 @@ DIFF_TEMP_HTML_SUFFIX = ".html"
 TIMESTAMP_FORMAT = "%Y-%m-%d_%H%M%S"
 TIMESTAMP_STEM_RE = re.compile(r"^(?P<base>.+)_\d{4}-\d{2}-\d{2}_\d{6}$")
 DEFAULT_TIMESTAMP_KEEP_OLD = "10"
+DEFAULT_QUOTA_PATTERNS = "*.py,*.js,*.jsx,*.mjs,*.cjs"
+DEFAULT_QUOTA_EXCLUDE_DIRS = DEFAULT_EXCLUDE_DIRS
+DEFAULT_QUOTA_PATH_RULES = ""
+
 
 
 def get_default_project_dir() -> Path:
@@ -1438,6 +1443,622 @@ window.addEventListener('scroll', updateActiveDiffMarker, {{ passive: true }});
 """
 
 
+# ---------- Quota Inspector ----------
+
+QUOTA_TOKEN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?P<label>Lm\d+|[A-Z]\d+(?:_\d+)*)(?![A-Za-z0-9])"
+)
+JS_IMPORT_RE = re.compile(
+    r"""
+    (?P<static>import\s+(?:[^;\n]*?\s+from\s+)?[\"'](?P<static_spec>[^\"']+)[\"'])
+    |
+    (?P<require>require\s*\(\s*[\"'](?P<require_spec>[^\"']+)[\"']\s*\))
+    |
+    (?P<dynamic>import\s*\(\s*[\"'](?P<dynamic_spec>[^\"']+)[\"']\s*\))
+    """,
+    re.VERBOSE,
+)
+
+
+@dataclass(slots=True, frozen=True)
+class QuotaRef:
+    label: str
+    family: str
+    number: int
+    rank: int
+
+
+@dataclass(slots=True, frozen=True)
+class QuotaPathRule:
+    prefix: str
+    quota: QuotaRef
+
+
+@dataclass(slots=True, frozen=True)
+class QuotaSourceUnit:
+    path: Path
+    rel_path: str
+    language: str
+    module_name: str
+    quota: QuotaRef | None
+    quota_source: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class QuotaDependency:
+    source_path: str
+    source_quota: str
+    target_spec: str
+    target_path: str
+    target_quota: str
+    language: str
+    line: int
+    kind: str
+    status: str
+    severity: str
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
+class QuotaInspectionResult:
+    root: Path
+    checked_files: int
+    python_files: int
+    js_files: int
+    quota_files: int
+    unknown_quota_files: tuple[str, ...]
+    dependencies: tuple[QuotaDependency, ...]
+
+    @property
+    def violations(self) -> tuple[QuotaDependency, ...]:
+        return tuple(item for item in self.dependencies if item.severity == "violation")
+
+    @property
+    def warnings(self) -> tuple[QuotaDependency, ...]:
+        return tuple(item for item in self.dependencies if item.severity == "warning")
+
+
+@dataclass(slots=True, frozen=True)
+class _RawImport:
+    spec: str
+    line: int
+    kind: str
+    relative: bool = False
+    level: int = 0
+
+
+def parse_quota_ref(raw: str | None) -> QuotaRef | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    match = QUOTA_TOKEN_RE.search(value)
+    if not match:
+        return None
+    label = match.group("label")
+    normalized = label[0].upper() + label[1:]
+    if normalized.lower().startswith("lm"):
+        try:
+            number = -int(normalized[2:] or "1")
+        except ValueError:
+            return None
+        return QuotaRef(label=f"Lm{abs(number)}", family="L", number=number, rank=number * 1000)
+
+    family = normalized[0].upper()
+    body = normalized[1:]
+    parts = body.split("_")
+    try:
+        number = int(parts[0])
+        subs = [int(item) for item in parts[1:] if item != ""]
+    except ValueError:
+        return None
+    # Subquote ordering: L2_1 < L2, L2_2 < L2_1, L2_1_1 < L2_1.
+    # Rank stays between L(n-1) and Ln for normal _n values.
+    rank = number * 1000 - sum(max(1, item) for item in subs)
+    return QuotaRef(label=normalized, family=family, number=number, rank=rank)
+
+
+def find_quota_token(text: str) -> QuotaRef | None:
+    return parse_quota_ref(text)
+
+
+def parse_quota_path_rules(raw: str | None) -> tuple[QuotaPathRule, ...]:
+    text = str(raw or "").strip()
+    if not text:
+        return ()
+    chunks: list[str] = []
+    for line in text.replace("\r", "\n").split("\n"):
+        chunks.extend(part.strip() for part in line.split(",") if part.strip())
+
+    rules: list[QuotaPathRule] = []
+    for chunk in chunks:
+        if "=" not in chunk:
+            continue
+        left, right = chunk.split("=", 1)
+        prefix = left.strip().replace("\\", "/").strip("/").lower()
+        quota = parse_quota_ref(right.strip())
+        if prefix and quota is not None:
+            rules.append(QuotaPathRule(prefix=prefix, quota=quota))
+    rules.sort(key=lambda item: len(item.prefix), reverse=True)
+    return tuple(rules)
+
+
+def detect_quota_for_rel_path(rel_path: str, rules: tuple[QuotaPathRule, ...], *, auto_detect: bool = True) -> tuple[QuotaRef | None, str]:
+    rel_norm = rel_path.replace("\\", "/").strip("/")
+    rel_lower = rel_norm.lower()
+    for rule in rules:
+        if rel_lower == rule.prefix or rel_lower.startswith(rule.prefix + "/"):
+            return rule.quota, f"path rule: {rule.prefix}={rule.quota.label}"
+
+    if not auto_detect:
+        return None, ""
+
+    parts = Path(rel_norm).parts
+    # Prefer explicit path components over full-path accidental matches.
+    for part in parts:
+        quota = find_quota_token(part)
+        if quota is not None:
+            return quota, f"path token: {part}"
+    quota = find_quota_token(rel_norm)
+    if quota is not None:
+        return quota, "path token"
+    return None, ""
+
+
+def _language_for_path(path: Path) -> str | None:
+    suffix = path.suffix.lower()
+    if suffix == ".py":
+        return "python"
+    if suffix in {".js", ".jsx", ".mjs", ".cjs"}:
+        return "javascript"
+    return None
+
+
+def _python_module_name(root: Path, path: Path) -> str:
+    rel = path.relative_to(root).as_posix()
+    parts = rel.split("/")
+    if not parts:
+        return path.stem
+    parts[-1] = Path(parts[-1]).stem
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(part for part in parts if part)
+
+
+def _build_python_module_map(units: list[QuotaSourceUnit]) -> dict[str, QuotaSourceUnit]:
+    module_map: dict[str, QuotaSourceUnit] = {}
+    for unit in units:
+        if unit.language != "python" or not unit.module_name:
+            continue
+        module_map.setdefault(unit.module_name, unit)
+        if unit.path.name == "__init__.py":
+            module_map.setdefault(unit.module_name, unit)
+    return module_map
+
+
+def _resolve_python_relative_module(source_module: str, source_path: Path, level: int, module: str | None) -> str:
+    if int(level or 0) <= 0:
+        return str(module or "").strip(".")
+
+    package_parts = source_module.split(".") if source_module else []
+    if source_path.name != "__init__.py":
+        package_parts = package_parts[:-1]
+    if level > 1:
+        package_parts = package_parts[: max(0, len(package_parts) - (level - 1))]
+    if module:
+        package_parts.extend(part for part in module.split(".") if part)
+    return ".".join(package_parts)
+
+
+def _resolve_python_module(module_name: str, module_map: dict[str, QuotaSourceUnit]) -> QuotaSourceUnit | None:
+    candidate = module_name.strip(".")
+    while candidate:
+        if candidate in module_map:
+            return module_map[candidate]
+        candidate = candidate.rsplit(".", 1)[0] if "." in candidate else ""
+    return None
+
+
+def _extract_python_imports(unit: QuotaSourceUnit) -> tuple[_RawImport, ...]:
+    try:
+        text = read_text_safely(unit.path)
+        tree = ast.parse(text, filename=str(unit.path))
+    except Exception:
+        return ()
+
+    imports: list[_RawImport] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append(_RawImport(spec=alias.name, line=int(getattr(node, "lineno", 0) or 0), kind="import"))
+        elif isinstance(node, ast.ImportFrom):
+            base = _resolve_python_relative_module(unit.module_name, unit.path, int(node.level or 0), node.module)
+            if node.names:
+                for alias in node.names:
+                    if alias.name == "*":
+                        imports.append(_RawImport(spec=base, line=int(getattr(node, "lineno", 0) or 0), kind="from", relative=bool(node.level), level=int(node.level or 0)))
+                    else:
+                        imports.append(_RawImport(spec=f"{base}.{alias.name}" if base else alias.name, line=int(getattr(node, "lineno", 0) or 0), kind="from", relative=bool(node.level), level=int(node.level or 0)))
+                        if base:
+                            imports.append(_RawImport(spec=base, line=int(getattr(node, "lineno", 0) or 0), kind="from-module", relative=bool(node.level), level=int(node.level or 0)))
+            elif base:
+                imports.append(_RawImport(spec=base, line=int(getattr(node, "lineno", 0) or 0), kind="from", relative=bool(node.level), level=int(node.level or 0)))
+    return tuple(imports)
+
+
+def _strip_js_comments(text: str) -> str:
+    # Light scanner: enough for import discovery, not a full JS lexer.
+    text = re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
+    return re.sub(r"(^|[^:])//.*", r"\1", text)
+
+
+def _extract_js_imports(unit: QuotaSourceUnit) -> tuple[_RawImport, ...]:
+    try:
+        text = read_text_safely(unit.path)
+    except Exception:
+        return ()
+    cleaned = _strip_js_comments(text)
+    imports: list[_RawImport] = []
+    for match in JS_IMPORT_RE.finditer(cleaned):
+        spec = match.group("static_spec") or match.group("require_spec") or match.group("dynamic_spec") or ""
+        if not spec:
+            continue
+        line = cleaned.count("\n", 0, match.start()) + 1
+        if match.group("require"):
+            kind = "require"
+        elif match.group("dynamic"):
+            kind = "dynamic-import"
+        else:
+            kind = "import"
+        imports.append(_RawImport(spec=spec, line=line, kind=kind, relative=spec.startswith(".")))
+    return tuple(imports)
+
+
+def _build_js_path_map(units: list[QuotaSourceUnit]) -> dict[str, QuotaSourceUnit]:
+    out: dict[str, QuotaSourceUnit] = {}
+    for unit in units:
+        if unit.language != "javascript":
+            continue
+        rel = unit.rel_path.replace("\\", "/")
+        stem = rel.rsplit(".", 1)[0]
+        out.setdefault(rel, unit)
+        out.setdefault(stem, unit)
+        if Path(rel).name.lower().startswith("index."):
+            out.setdefault(str(Path(rel).parent).replace("\\", "/"), unit)
+    return out
+
+
+def _resolve_js_spec(unit: QuotaSourceUnit, spec: str, root: Path, js_path_map: dict[str, QuotaSourceUnit]) -> QuotaSourceUnit | None:
+    spec = str(spec or "").strip()
+    if not spec:
+        return None
+    suffixes = ["", ".js", ".jsx", ".mjs", ".cjs", "/index.js", "/index.jsx", "/index.mjs", "/index.cjs"]
+    if spec.startswith("."):
+        base = (unit.path.parent / spec).resolve()
+        for suffix in suffixes:
+            candidate = Path(str(base) + suffix) if suffix else base
+            try:
+                rel = candidate.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            found = js_path_map.get(rel) or js_path_map.get(rel.rsplit(".", 1)[0])
+            if found is not None:
+                return found
+        return None
+
+    # Absolute project-style import, if it maps to an included JS file.
+    key = spec.replace("\\", "/").strip("/")
+    for suffix in suffixes:
+        found = js_path_map.get(key + suffix) if suffix else js_path_map.get(key)
+        if found is not None:
+            return found
+    return None
+
+
+def _dependency_status(source: QuotaSourceUnit, target: QuotaSourceUnit | None, raw: _RawImport) -> tuple[str, str, str]:
+    if target is None:
+        if raw.relative:
+            return "unresolved", "warning", "Local import target was not resolved."
+        return "external", "info", "External or non-included import."
+    if source.quota is None or target.quota is None:
+        return "unknown_quota", "warning", "Source or target quota is unknown."
+    if source.rel_path == target.rel_path:
+        return "self", "info", "Self/package import."
+    if target.quota.rank > source.quota.rank:
+        return "upward_import", "violation", "Source imports a higher quota."
+    if target.quota.rank == source.quota.rank:
+        if target.quota.label == source.quota.label:
+            return "same_quota_import", "violation", "Source imports another member of the same quota."
+        return "same_depth_import", "violation", "Source imports another quota at the same dependency depth."
+    return "ok", "ok", "Downward dependency."
+
+
+def _make_dependency(source: QuotaSourceUnit, target: QuotaSourceUnit | None, raw: _RawImport) -> QuotaDependency:
+    status, severity, message = _dependency_status(source, target, raw)
+    return QuotaDependency(
+        source_path=source.rel_path,
+        source_quota=source.quota.label if source.quota else "?",
+        target_spec=raw.spec,
+        target_path=target.rel_path if target is not None else "",
+        target_quota=target.quota.label if target is not None and target.quota else "?",
+        language=source.language,
+        line=int(raw.line or 0),
+        kind=raw.kind,
+        status=status,
+        severity=severity,
+        message=message,
+    )
+
+
+def inspect_quota_dependencies(
+    *,
+    root: Path,
+    patterns: list[str],
+    exclude_dirs: set[str],
+    path_rules: tuple[QuotaPathRule, ...],
+    auto_detect: bool = True,
+    skip_binary: bool = True,
+) -> QuotaInspectionResult:
+    files = collect_files(root, exclude_dirs, patterns, skip_binary)
+    units: list[QuotaSourceUnit] = []
+    for path in files:
+        language = _language_for_path(path)
+        if language is None:
+            continue
+        rel = rel_posix(root, path)
+        quota, quota_source = detect_quota_for_rel_path(rel, path_rules, auto_detect=auto_detect)
+        module_name = _python_module_name(root, path) if language == "python" else rel.rsplit(".", 1)[0].replace("/", ".")
+        units.append(
+            QuotaSourceUnit(
+                path=path,
+                rel_path=rel,
+                language=language,
+                module_name=module_name,
+                quota=quota,
+                quota_source=quota_source,
+            )
+        )
+
+    by_path = {unit.rel_path: unit for unit in units}
+    python_module_map = _build_python_module_map(units)
+    js_path_map = _build_js_path_map(units)
+    project_python_roots = {name.split(".", 1)[0] for name in python_module_map if name}
+
+    dependencies: list[QuotaDependency] = []
+    for unit in units:
+        if unit.language == "python":
+            for raw in _extract_python_imports(unit):
+                target = _resolve_python_module(raw.spec, python_module_map)
+                if target is None and not raw.relative and raw.spec.split(".", 1)[0] not in project_python_roots:
+                    # external dependency: keep it out of the report to reduce noise.
+                    continue
+                dep = _make_dependency(unit, target, raw)
+                if dep.status != "self":
+                    dependencies.append(dep)
+        elif unit.language == "javascript":
+            for raw in _extract_js_imports(unit):
+                target = _resolve_js_spec(unit, raw.spec, root, js_path_map)
+                if target is None and not raw.relative:
+                    continue
+                dep = _make_dependency(unit, target, raw)
+                if dep.status != "self":
+                    dependencies.append(dep)
+
+    unknown_files = tuple(sorted((unit.rel_path for unit in units if unit.quota is None), key=str.lower))
+    return QuotaInspectionResult(
+        root=root,
+        checked_files=len(units),
+        python_files=sum(1 for unit in units if unit.language == "python"),
+        js_files=sum(1 for unit in units if unit.language == "javascript"),
+        quota_files=sum(1 for unit in units if unit.quota is not None),
+        unknown_quota_files=unknown_files,
+        dependencies=tuple(dependencies),
+    )
+
+
+def _quota_status_label(status: str) -> str:
+    return {
+        "upward_import": "UPWARD",
+        "same_quota_import": "SAME QUOTA",
+        "same_depth_import": "SAME DEPTH",
+        "unknown_quota": "UNKNOWN QUOTA",
+        "unresolved": "UNRESOLVED",
+        "ok": "OK",
+    }.get(status, status.replace("_", " ").upper())
+
+
+def _quota_anchor(dep: QuotaDependency, index: int) -> str:
+    raw = f"{index}:{dep.source_path}:{dep.line}:{dep.target_spec}:{dep.status}"
+    return "quota-" + hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def build_quota_report_html(result: QuotaInspectionResult) -> str:
+    violations = list(result.violations)
+    warnings = list(result.warnings)
+    rows = [dep for dep in result.dependencies if dep.severity in {"violation", "warning"}]
+    rows.sort(key=lambda d: (0 if d.severity == "violation" else 1, d.source_path.lower(), d.line, d.target_spec.lower()))
+
+    nav_items: list[str] = []
+    blocks: list[str] = []
+    for index, dep in enumerate(rows, start=1):
+        anchor = _quota_anchor(dep, index)
+        status_label = _quota_status_label(dep.status)
+        safe_source = _html_escape(dep.source_path)
+        safe_target = _html_escape(dep.target_path or dep.target_spec)
+        safe_spec = _html_escape(dep.target_spec)
+        safe_msg = _html_escape(dep.message)
+        css = html_lib.escape(dep.status)
+        severity = html_lib.escape(dep.severity)
+        nav_items.append(
+            f"<a class='nav-item {css} {severity}' href='#{anchor}' data-path='{html_lib.escape((dep.source_path + ' ' + dep.target_spec + ' ' + dep.status).lower())}' data-status='{css}'>"
+            f"<span>{'!' if dep.severity == 'violation' else '?'}</span>{safe_source}:{dep.line} → {safe_target}</a>"
+        )
+        blocks.append(
+            f"""
+<section id="{anchor}" class="file-block quota-block" data-path="{html_lib.escape((dep.source_path + ' ' + dep.target_spec + ' ' + dep.status).lower())}" data-status="{css}">
+  <div class="file-head">
+    <span class="badge {css} {severity}">{status_label}</span>
+    <h2>{safe_source}:{dep.line}</h2>
+  </div>
+  <table class="quota-table">
+    <tbody>
+      <tr><th>Source quota</th><td>{_html_escape(dep.source_quota)}</td></tr>
+      <tr><th>Target quota</th><td>{_html_escape(dep.target_quota)}</td></tr>
+      <tr><th>Import</th><td><code>{safe_spec}</code></td></tr>
+      <tr><th>Resolved target</th><td>{safe_target or '—'}</td></tr>
+      <tr><th>Language</th><td>{_html_escape(dep.language)} / {_html_escape(dep.kind)}</td></tr>
+      <tr><th>Reason</th><td>{safe_msg}</td></tr>
+    </tbody>
+  </table>
+</section>
+"""
+        )
+
+    unknown_sample = "".join(f"<li>{_html_escape(path)}</li>" for path in result.unknown_quota_files[:200])
+    unknown_extra = "" if len(result.unknown_quota_files) <= 200 else f"<li>… {len(result.unknown_quota_files) - 200} more</li>"
+    unknown_block = ""
+    if result.unknown_quota_files:
+        unknown_block = f"""
+<section class="file-block diagnostics" data-path="unknown quota files" data-status="unknown_quota">
+  <div class="file-head"><span class="badge unknown_quota warning">UNKNOWN FILES</span><h2>Files without quota</h2></div>
+  <div class="diag-body">
+    <p>{len(result.unknown_quota_files)} file(s) have no quota marker and no matching path rule.</p>
+    <ul>{unknown_sample}{unknown_extra}</ul>
+  </div>
+</section>
+"""
+
+    body = "\n".join(blocks) + unknown_block if (blocks or unknown_block) else "<section class='empty'>No quota violations found.</section>"
+    nav = "".join(nav_items) if nav_items else "<div class='meta'>No violations or warnings.</div>"
+    created = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DumpIt Quota Inspector</title>
+<style>
+:root {{
+  --bg: #0b1020;
+  --panel: #111827;
+  --panel-2: #172033;
+  --text: #e5e7eb;
+  --muted: #9ca3af;
+  --border: #263244;
+  --bad: #ff1744;
+  --warn: #ffd60a;
+  --ok: #00e676;
+  --bad-bg: #ffc7d2;
+  --warn-bg: #fff0a3;
+  --change-text: #050505;
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }}
+header {{ position: sticky; top: 0; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 22px; background: rgba(11,16,32,.92); border-bottom: 1px solid var(--border); backdrop-filter: blur(10px); }}
+h1 {{ margin: 0; font-size: 18px; font-weight: 700; }}
+.meta {{ color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60vw; }}
+.summary {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.card {{ padding: 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); min-width: 96px; text-align: center; }}
+.card b {{ display: block; font-size: 18px; }}
+.layout {{ display: grid; grid-template-columns: 340px minmax(0, 1fr); min-height: calc(100vh - 82px); }}
+aside {{ position: sticky; top: 82px; align-self: start; height: calc(100vh - 82px); overflow: auto; padding: 14px; border-right: 1px solid var(--border); background: var(--panel); }}
+.search {{ width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: #0b1020; color: var(--text); outline: none; margin-bottom: 12px; }}
+.nav-item {{ display: grid; grid-template-columns: 24px 1fr; gap: 8px; align-items: center; padding: 8px 9px; margin: 4px 0; border: 1px solid transparent; border-radius: 10px; color: var(--text); text-decoration: none; word-break: break-all; }}
+.nav-item:hover {{ border-color: var(--border); background: var(--panel-2); }}
+.nav-item span {{ display: inline-flex; width: 22px; height: 22px; border-radius: 7px; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; color: #050505; }}
+.nav-item.violation span, .badge.violation {{ background: var(--bad); color: #050505; }}
+.nav-item.warning span, .badge.warning {{ background: var(--warn); color: #050505; }}
+main {{ padding: 18px 42px 18px 18px; overflow: hidden; }}
+.diff-map {{ position: fixed; right: 12px; top: 96px; bottom: 16px; width: 20px; z-index: 20; border: 1px solid var(--border); border-radius: 999px; background: rgba(17,24,39,.88); box-shadow: 0 10px 35px rgba(0,0,0,.35); overflow: hidden; }}
+.diff-map-marker {{ position: absolute; left: 3px; right: 3px; min-height: 5px; border-radius: 999px; cursor: pointer; opacity: .95; border: 1px solid rgba(0,0,0,.35); }}
+.diff-map-marker:hover {{ left: 1px; right: 1px; opacity: 1; }}
+.diff-map-marker.upward_import, .diff-map-marker.same_quota_import, .diff-map-marker.same_depth_import {{ background: var(--bad); }}
+.diff-map-marker.unknown_quota, .diff-map-marker.unresolved {{ background: var(--warn); }}
+.diff-map-marker.active {{ outline: 2px solid #ffffff; outline-offset: 1px; }}
+.file-block {{ margin: 0 0 18px; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; background: var(--panel); box-shadow: 0 12px 40px rgba(0,0,0,.25); }}
+.file-head {{ display: flex; align-items: center; gap: 10px; padding: 12px 14px; background: var(--panel-2); border-bottom: 1px solid var(--border); }}
+.file-head h2 {{ margin: 0; font-size: 14px; font-weight: 650; word-break: break-all; }}
+.badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 800; letter-spacing: .04em; }}
+.quota-table {{ width: 100%; border-collapse: collapse; table-layout: fixed; font: 13px/1.42 system-ui, -apple-system, Segoe UI, sans-serif; }}
+.quota-table th {{ width: 180px; padding: 9px 12px; color: var(--muted); text-align: left; vertical-align: top; border-bottom: 1px solid rgba(255,255,255,.05); background: rgba(0,0,0,.13); }}
+.quota-table td {{ padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,.05); word-break: break-word; }}
+code {{ font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #d1d5db; }}
+.diag-body {{ padding: 12px 18px; }}
+.diag-body ul {{ margin: 8px 0 0; padding-left: 20px; color: #d1d5db; }}
+.empty {{ padding: 40px; border: 1px solid var(--border); border-radius: 16px; background: var(--panel); color: var(--muted); }}
+@media (max-width: 900px) {{ .layout {{ grid-template-columns: 1fr; }} aside {{ position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--border); }} main {{ padding-right: 18px; }} .diff-map {{ display: none; }} header {{ align-items: flex-start; flex-direction: column; }} .meta {{ max-width: 100%; }} }}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>DumpIt Quota Inspector</h1>
+    <div class="meta">Root: {_html_escape(str(result.root))}<br>Created: {created}</div>
+  </div>
+  <div class="summary">
+    <div class="card"><b>{len(violations)}</b>violations</div>
+    <div class="card"><b>{len(warnings)}</b>warnings</div>
+    <div class="card"><b>{result.checked_files}</b>files</div>
+    <div class="card"><b>{result.quota_files}</b>with quota</div>
+    <div class="card"><b>{len(result.unknown_quota_files)}</b>unknown</div>
+  </div>
+</header>
+<div class="layout">
+  <aside>
+    <input id="filter" class="search" placeholder="Filter violations..." autofocus>
+    <nav id="nav">{nav}</nav>
+  </aside>
+  <main id="content">{body}</main>
+</div>
+<div id="diff-map" class="diff-map" title="Violation map"></div>
+<script>
+const filter = document.getElementById('filter');
+const diffMap = document.getElementById('diff-map');
+function visibleFileBlocks() {{ return Array.from(document.querySelectorAll('.quota-block')).filter(el => el.style.display !== 'none'); }}
+function renderDiffMap() {{
+  if (!diffMap) return;
+  diffMap.innerHTML = '';
+  const blocks = visibleFileBlocks();
+  const maxScroll = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+  blocks.forEach(block => {{
+    const marker = document.createElement('button');
+    marker.type = 'button';
+    marker.className = `diff-map-marker ${{block.dataset.status || ''}}`;
+    marker.title = block.dataset.path || '';
+    const topPct = Math.max(0, Math.min(98, (block.offsetTop / maxScroll) * 100));
+    const heightPct = Math.max(1.2, Math.min(18, (block.offsetHeight / document.documentElement.scrollHeight) * 100));
+    marker.style.top = `${{topPct}}%`;
+    marker.style.height = `${{heightPct}}%`;
+    marker.addEventListener('click', () => block.scrollIntoView({{ behavior: 'smooth', block: 'start' }}));
+    diffMap.appendChild(marker);
+  }});
+  updateActiveDiffMarker();
+}}
+function updateActiveDiffMarker() {{
+  if (!diffMap) return;
+  const blocks = visibleFileBlocks();
+  const y = window.scrollY + 120;
+  let activeIndex = -1;
+  for (let i = 0; i < blocks.length; i++) {{ if (blocks[i].offsetTop <= y) activeIndex = i; }}
+  Array.from(diffMap.children).forEach((marker, i) => marker.classList.toggle('active', i === activeIndex));
+}}
+filter.addEventListener('input', () => {{
+  const q = filter.value.trim().toLowerCase();
+  document.querySelectorAll('.nav-item, .quota-block').forEach(el => {{
+    const path = el.dataset.path || '';
+    el.style.display = path.includes(q) ? '' : 'none';
+  }});
+  renderDiffMap();
+}});
+window.addEventListener('load', renderDiffMap);
+window.addEventListener('resize', renderDiffMap);
+window.addEventListener('scroll', updateActiveDiffMarker, {{ passive: true }});
+</script>
+</body>
+</html>
+"""
+
+
 class DumpItApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1504,6 +2125,14 @@ class DumpItApp(tk.Tk):
         self.patch_auto_detect = tk.BooleanVar(value=True)
         self._patch_drop_ref = None
 
+        # Quota Inspector state
+        self.quota_patterns = tk.StringVar(value=DEFAULT_QUOTA_PATTERNS)
+        self.quota_exclude_dirs = tk.StringVar(value=DEFAULT_QUOTA_EXCLUDE_DIRS)
+        self.quota_path_rules = tk.StringVar(value=DEFAULT_QUOTA_PATH_RULES)
+        self.quota_auto_detect = tk.BooleanVar(value=True)
+        self.quota_report_file = tk.StringVar(value="")
+        self._last_quota_result: QuotaInspectionResult | None = None
+
         self._build_ui()
         self.patch_target_dir.trace_add("write", lambda *_args: self._refresh_apply_patch_target())
         self.patch_file.trace_add("write", lambda *_args: self._refresh_apply_patch_target())
@@ -1554,12 +2183,14 @@ class DumpItApp(tk.Tk):
         self.tab_batch = ttk.Frame(self.nb)
         self.tab_diff = ttk.Frame(self.nb)
         self.tab_apply_patch = ttk.Frame(self.nb)
+        self.tab_quota = ttk.Frame(self.nb)
 
         self.nb.add(self.tab_export, text="Export")
         self.nb.add(self.tab_watch, text="Watch")
         self.nb.add(self.tab_batch, text="Batch")
         self.nb.add(self.tab_diff, text="Diff")
         self.nb.add(self.tab_apply_patch, text="Apply Patch")
+        self.nb.add(self.tab_quota, text="Quota")
 
         # ---------- EXPORT TAB ----------
         export_root = self.tab_export
@@ -1641,6 +2272,9 @@ class DumpItApp(tk.Tk):
 
         # ---------- APPLY PATCH TAB ----------
         self._build_apply_patch_tab(self.tab_apply_patch, pad)
+
+        # ---------- QUOTA TAB ----------
+        self._build_quota_tab(self.tab_quota, pad)
 
         # ---------- SHARED LOG ----------
         self.log = tk.Text(root, height=5, wrap="word")
@@ -1860,6 +2494,11 @@ class DumpItApp(tk.Tk):
                 "patch_reverse": "False",
                 "patch_backup": "True",
                 "patch_auto_detect": "True",
+                "quota_patterns": DEFAULT_QUOTA_PATTERNS,
+                "quota_exclude_dirs": DEFAULT_QUOTA_EXCLUDE_DIRS,
+                "quota_path_rules": DEFAULT_QUOTA_PATH_RULES,
+                "quota_auto_detect": "True",
+                "quota_report_file": "",
             }
 
     # ---------- Batch selection persistence ----------
@@ -1923,6 +2562,11 @@ class DumpItApp(tk.Tk):
                 "patch_reverse": "False",
                 "patch_backup": "True",
                 "patch_auto_detect": "True",
+                "quota_patterns": DEFAULT_QUOTA_PATTERNS,
+                "quota_exclude_dirs": DEFAULT_QUOTA_EXCLUDE_DIRS,
+                "quota_path_rules": DEFAULT_QUOTA_PATH_RULES,
+                "quota_auto_detect": "True",
+                "quota_report_file": "",
             }
 
         s = self._cp[sec_real]
@@ -1950,6 +2594,11 @@ class DumpItApp(tk.Tk):
             self.patch_reverse.set(s.getboolean("patch_reverse", fallback=False))
             self.patch_backup.set(s.getboolean("patch_backup", fallback=True))
             self.patch_auto_detect.set(s.getboolean("patch_auto_detect", fallback=True))
+            self.quota_patterns.set(s.get("quota_patterns", DEFAULT_QUOTA_PATTERNS))
+            self.quota_exclude_dirs.set(s.get("quota_exclude_dirs", DEFAULT_QUOTA_EXCLUDE_DIRS))
+            self.quota_path_rules.set(s.get("quota_path_rules", DEFAULT_QUOTA_PATH_RULES))
+            self.quota_auto_detect.set(s.getboolean("quota_auto_detect", fallback=True))
+            self.quota_report_file.set(normalize_ui_path(s.get("quota_report_file", "")))
 
             # Se il profilo non ha output_file, calcolane uno di default per quella project_dir
             self._ensure_output_default()
@@ -1982,6 +2631,11 @@ class DumpItApp(tk.Tk):
         self._cp[sec_real]["patch_reverse"] = str(self.patch_reverse.get())
         self._cp[sec_real]["patch_backup"] = str(self.patch_backup.get())
         self._cp[sec_real]["patch_auto_detect"] = str(self.patch_auto_detect.get())
+        self._cp[sec_real]["quota_patterns"] = self.quota_patterns.get()
+        self._cp[sec_real]["quota_exclude_dirs"] = self.quota_exclude_dirs.get()
+        self._cp[sec_real]["quota_path_rules"] = self.quota_path_rules.get()
+        self._cp[sec_real]["quota_auto_detect"] = str(self.quota_auto_detect.get())
+        self._cp[sec_real]["quota_report_file"] = normalize_ui_path(self.quota_report_file.get())
 
     def _load_config(self) -> None:
         # carica ini
@@ -2164,6 +2818,11 @@ class DumpItApp(tk.Tk):
         self.patch_reverse.set(False)
         self.patch_backup.set(True)
         self.patch_auto_detect.set(True)
+        self.quota_patterns.set(DEFAULT_QUOTA_PATTERNS)
+        self.quota_exclude_dirs.set(DEFAULT_QUOTA_EXCLUDE_DIRS)
+        self.quota_path_rules.set(DEFAULT_QUOTA_PATH_RULES)
+        self.quota_auto_detect.set(True)
+        self.quota_report_file.set("")
         self._ensure_output_default()
         self._log("Reset to defaults (not saved yet).")
 
@@ -2691,6 +3350,156 @@ class DumpItApp(tk.Tk):
             self._set_apply_patch_status(status)
             self._log(status)
             messagebox.showerror("Apply Patch", status)
+
+
+
+    # ---------- Quota Inspector UI / Runner ----------
+    def _build_quota_tab(self, parent: ttk.Frame, pad: dict) -> None:
+        info = ttk.LabelFrame(parent, text="Quota Inspector")
+        info.pack(fill="both", expand=True, **pad)
+
+        desc = ttk.Label(
+            info,
+            text=(
+                "Static dependency check for Quota Development. "
+                "Python and JavaScript imports are resolved against included project files. "
+                "Violations: same-quota import, same-depth import, upward import. "
+                "Report output is HTML, same style as Diff."
+            ),
+            wraplength=820,
+            justify="left",
+        )
+        desc.pack(fill="x", padx=8, pady=(8, 4))
+
+        patterns_frame = ttk.LabelFrame(info, text="Included source patterns")
+        patterns_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(patterns_frame, textvariable=self.quota_patterns).pack(fill="x", padx=8, pady=8)
+
+        exclude_frame = ttk.LabelFrame(info, text="Exclude folders")
+        exclude_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(exclude_frame, textvariable=self.quota_exclude_dirs).pack(fill="x", padx=8, pady=8)
+
+        rules_frame = ttk.LabelFrame(info, text="Optional path quota rules: path/prefix=Quota, comma-separated")
+        rules_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(rules_frame, textvariable=self.quota_path_rules).pack(fill="x", padx=8, pady=8)
+
+        examples = ttk.Label(
+            rules_frame,
+            text="Example: app/api=A2, app/services=S2, app/runtime=S2, app/core=S3, app/ui=U3, app/ui/assets=U4",
+            wraplength=820,
+            justify="left",
+        )
+        examples.pack(fill="x", padx=8, pady=(0, 8))
+
+        report_frame = ttk.LabelFrame(info, text="HTML report file")
+        report_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(report_frame, textvariable=self.quota_report_file).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        ttk.Button(report_frame, text="Choose…", command=self._choose_quota_report_file).pack(side="left", padx=8, pady=8)
+
+        options = ttk.Frame(info)
+        options.pack(fill="x", padx=8, pady=6)
+        ttk.Checkbutton(
+            options,
+            text="Auto-detect quota tokens in path names if no path rule matches",
+            variable=self.quota_auto_detect,
+        ).pack(side="left", padx=4)
+
+        actions = ttk.Frame(info)
+        actions.pack(fill="x", padx=8, pady=6)
+        ttk.Button(actions, text="Open HTML report", command=self._open_quota_report).pack(side="left", padx=4)
+        ttk.Button(actions, text="Save HTML report", command=self._save_quota_report).pack(side="left", padx=4)
+
+        details = ttk.LabelFrame(info, text="Status")
+        details.pack(fill="both", expand=True, padx=8, pady=(6, 10))
+        self.lbl_quota_status = ttk.Label(details, text="No inspection run.", wraplength=820, justify="left")
+        self.lbl_quota_status.pack(fill="x", padx=8, pady=8)
+
+    def _choose_quota_report_file(self) -> None:
+        current = normalize_ui_path(self.quota_report_file.get().strip())
+        initialdir = normalize_ui_path(self.project_dir.get().strip()) or str(get_default_project_dir())
+        initialfile = "quota_inspector_report.html"
+        if current:
+            try:
+                curp = Path(current).resolve()
+                initialdir = str(curp.parent)
+                initialfile = curp.name
+            except Exception:
+                pass
+
+        f = filedialog.asksaveasfilename(
+            title="Choose Quota Inspector HTML report",
+            initialdir=initialdir,
+            initialfile=initialfile,
+            defaultextension=".html",
+            filetypes=[("HTML files", "*.html *.htm"), ("All files", "*.*")],
+        )
+        if f:
+            self.quota_report_file.set(normalize_ui_path(f))
+
+    def _get_quota_settings(self) -> tuple[Path, list[str], set[str], tuple[QuotaPathRule, ...], bool]:
+        root = Path(normalize_ui_path(self.project_dir.get())).resolve()
+        if not root.exists():
+            raise FileNotFoundError("Project folder does not exist.")
+        patterns = normalize_patterns(parse_csv_list(self.quota_patterns.get()))
+        if not patterns:
+            raise ValueError("Quota source patterns cannot be empty.")
+        exclude_dirs = {x.lower() for x in parse_csv_list(self.quota_exclude_dirs.get())}
+        rules = parse_quota_path_rules(self.quota_path_rules.get())
+        return root, patterns, exclude_dirs, rules, bool(self.quota_auto_detect.get())
+
+    def _run_quota_inspection(self) -> QuotaInspectionResult:
+        root, patterns, exclude_dirs, rules, auto_detect = self._get_quota_settings()
+        result = inspect_quota_dependencies(
+            root=root,
+            patterns=patterns,
+            exclude_dirs=exclude_dirs,
+            path_rules=rules,
+            auto_detect=auto_detect,
+            skip_binary=True,
+        )
+        self._last_quota_result = result
+        status = (
+            f"Checked {result.checked_files} files: Python {result.python_files}, JS {result.js_files}. "
+            f"Quota files {result.quota_files}, unknown quota files {len(result.unknown_quota_files)}. "
+            f"Violations {len(result.violations)}, warnings {len(result.warnings)}."
+        )
+        self.lbl_quota_status.configure(text=status)
+        self._log(f"Quota Inspector: {status}")
+        return result
+
+    def _open_quota_report(self) -> None:
+        try:
+            result = self._run_quota_inspection()
+            html = build_quota_report_html(result)
+            out_dir = get_diff_temp_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"dumpit_quota_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.html"
+            out_path.write_text(html, encoding="utf-8")
+            webbrowser.open(out_path.as_uri())
+            self._log(f"Quota Inspector HTML opened: {out_path}")
+        except Exception as e:
+            messagebox.showerror("Quota Inspector", str(e))
+
+    def _save_quota_report(self) -> None:
+        try:
+            result = self._run_quota_inspection()
+            raw = normalize_ui_path(self.quota_report_file.get().strip())
+            if not raw:
+                self._choose_quota_report_file()
+                raw = normalize_ui_path(self.quota_report_file.get().strip())
+            if not raw:
+                return
+            out_path = Path(raw).resolve()
+            if out_path.suffix.lower() not in {".html", ".htm"}:
+                out_path = out_path.with_suffix(".html")
+                self.quota_report_file.set(normalize_ui_path(str(out_path)))
+            ensure_parent_dir(out_path)
+            out_path.write_text(build_quota_report_html(result), encoding="utf-8")
+            self._save_config(silent=True)
+            self._log(f"Quota Inspector HTML saved: {out_path}")
+            messagebox.showinfo("Quota Inspector", f"Report saved.\nOutput: {out_path}")
+        except Exception as e:
+            messagebox.showerror("Quota Inspector", str(e))
 
 
     def _build_watch_tab(self, parent: ttk.Frame, pad: dict) -> None:
