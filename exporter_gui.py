@@ -1889,28 +1889,25 @@ def _known_quota_refs(units: list[QuotaSourceUnit]) -> tuple[QuotaRef, ...]:
     for unit in units:
         if unit.quota is not None:
             by_label.setdefault(unit.quota.label, unit.quota)
-    return tuple(sorted(by_label.values(), key=lambda item: (item.rank, item.family, item.label)))
+    return tuple(sorted(by_label.values(), key=lambda item: (item.number, item.family, item.label)))
 
 
-def _expected_adjacent_target_rank(source_quota: QuotaRef, known_quotas: tuple[QuotaRef, ...]) -> int:
-    # Subquotes are local foundations of their parent quota. If a lower subquote
-    # exists under the same family/number, it becomes the immediate neighbor.
-    lower_same_base = [
-        int(item.rank)
-        for item in known_quotas
-        if item.family == source_quota.family
-        and item.number == source_quota.number
-        and int(item.rank) < int(source_quota.rank)
-    ]
-    if lower_same_base:
-        return max(lower_same_base)
-    return (int(source_quota.number) - 1) * 1000
+def _quota_rank_number(quota: QuotaRef) -> int:
+    """Return the Quota Rank Adjacency Rule rank.
+
+    QRAR deliberately ignores the family letter. A3, S3 and U3 all belong to Q3.
+    Subquote suffixes remain useful as labels, but the rank used by QRAR is the
+    numeric quota prefix.
+    """
+    return int(quota.number)
 
 
-def _is_quota_adjacent_dependency(source_quota: QuotaRef, target_quota: QuotaRef, known_quotas: tuple[QuotaRef, ...]) -> bool:
-    if int(target_quota.rank) >= int(source_quota.rank):
-        return False
-    return int(target_quota.rank) == _expected_adjacent_target_rank(source_quota, known_quotas)
+def _expected_adjacent_target_rank(source_quota: QuotaRef, known_quotas: tuple[QuotaRef, ...] = ()) -> int:
+    return _quota_rank_number(source_quota) - 1
+
+
+def _is_quota_rank_adjacent_dependency(source_quota: QuotaRef, target_quota: QuotaRef) -> bool:
+    return _quota_rank_number(target_quota) == _expected_adjacent_target_rank(source_quota)
 
 
 def _dependency_status(
@@ -1927,20 +1924,36 @@ def _dependency_status(
         return "unknown_quota", "warning", "Source or target quota is unknown."
     if source.rel_path == target.rel_path:
         return "self", "info", "Self/package import."
-    if target.quota.rank > source.quota.rank:
-        return "upward_import", "violation", "Source imports a higher quota."
-    if target.quota.rank == source.quota.rank:
-        if target.quota.label == source.quota.label:
-            return "same_quota_import", "violation", "Source imports another member of the same quota."
-        return "same_depth_import", "violation", "Source imports another quota at the same dependency depth."
-    if not _is_quota_adjacent_dependency(source.quota, target.quota, known_quotas):
-        expected_rank = _expected_adjacent_target_rank(source.quota, known_quotas)
+
+    source_rank = _quota_rank_number(source.quota)
+    target_rank = _quota_rank_number(target.quota)
+    expected_rank = _expected_adjacent_target_rank(source.quota)
+
+    if target_rank > source_rank:
         return (
-            "quota_adjacency_violation",
+            "upward_import",
             "violation",
-            f"Quota Adjacency Rule broken: source may import only the immediately underlying quota rank ({expected_rank}).",
+            f"Quota Rank Adjacency Rule broken: source Q{source_rank} may import only Q{expected_rank}; target is Q{target_rank}.",
         )
-    return "ok", "ok", "Adjacent downward dependency."
+    if target_rank == source_rank:
+        if target.quota.label == source.quota.label:
+            return (
+                "same_quota_import",
+                "violation",
+                f"Quota Rank Adjacency Rule broken: source Q{source_rank} imports another member of the same quota; expected Q{expected_rank}.",
+            )
+        return (
+            "same_depth_import",
+            "violation",
+            f"Quota Rank Adjacency Rule broken: source Q{source_rank} imports another quota at the same rank; expected Q{expected_rank}.",
+        )
+    if not _is_quota_rank_adjacent_dependency(source.quota, target.quota):
+        return (
+            "quota_rank_adjacency_violation",
+            "violation",
+            f"Quota Rank Adjacency Rule broken: source Q{source_rank} may import only Q{expected_rank}; target is Q{target_rank}.",
+        )
+    return "ok", "ok", f"Adjacent quota-rank dependency: Q{source_rank} -> Q{target_rank}."
 
 
 def _make_dependency(
@@ -1963,6 +1976,99 @@ def _make_dependency(
         severity=severity,
         message=message,
     )
+
+
+def _is_quota_rank_rule_break(dep: QuotaDependency) -> bool:
+    return dep.severity == "violation" and dep.status in {
+        "upward_import",
+        "same_quota_import",
+        "same_depth_import",
+        "quota_adjacency_violation",          # legacy status, kept for old reports/tests
+        "quota_rank_adjacency_violation",
+    }
+
+
+def _format_indirect_quota_chain(chain: tuple[QuotaDependency, ...]) -> str:
+    if not chain:
+        return ""
+    nodes = [chain[0].source_path]
+    for dep in chain:
+        nodes.append(dep.target_path or dep.target_spec)
+    return " -> ".join(nodes)
+
+
+def _build_quota_indirect_dependencies(
+    direct_dependencies: list[QuotaDependency],
+    *,
+    max_depth: int = 12,
+    max_reports: int = 5000,
+) -> tuple[QuotaDependency, ...]:
+    """Find logical/transitive quota violations.
+
+    Direct imports catch the immediate broken edge. This pass reports upstream
+    files that reach a broken edge through at least one resolved import, so a
+    source is flagged when it logically depends on a forbidden dependency chain.
+    Fully adjacent chains such as Q4 -> Q3 -> Q2 are not reported, and normal
+    downstream edges after an already reported break are not duplicated.
+    """
+    adjacency: dict[str, list[QuotaDependency]] = {}
+    for dep in direct_dependencies:
+        if dep.status == "self" or not dep.source_path or not dep.target_path:
+            continue
+        if dep.status in {"external", "unresolved", "unknown_quota"}:
+            continue
+        adjacency.setdefault(dep.source_path, []).append(dep)
+
+    out: list[QuotaDependency] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for start_path in sorted(adjacency, key=str.lower):
+        stack: list[tuple[str, tuple[QuotaDependency, ...], bool, frozenset[str]]] = [
+            (start_path, (), False, frozenset({start_path}))
+        ]
+        while stack and len(out) < max_reports:
+            current_path, chain, has_break, visited = stack.pop()
+            if len(chain) >= max_depth:
+                continue
+            for edge in adjacency.get(current_path, []):
+                next_path = edge.target_path
+                if not next_path or next_path in visited:
+                    continue
+                next_chain = chain + (edge,)
+                edge_breaks_rule = _is_quota_rank_rule_break(edge)
+                next_has_break = has_break or edge_breaks_rule
+
+                if edge_breaks_rule and len(next_chain) >= 2:
+                    first = next_chain[0]
+                    last = next_chain[-1]
+                    key = (start_path, last.target_path or last.target_spec, "quota_rank_indirect_violation")
+                    if key not in seen:
+                        seen.add(key)
+                        broken = next((item for item in next_chain if _is_quota_rank_rule_break(item)), next_chain[-1])
+                        chain_text = _format_indirect_quota_chain(next_chain)
+                        out.append(
+                            QuotaDependency(
+                                source_path=first.source_path,
+                                source_quota=first.source_quota,
+                                target_spec=chain_text,
+                                target_path=last.target_path,
+                                target_quota=last.target_quota,
+                                language="mixed" if any(item.language != first.language for item in next_chain) else first.language,
+                                line=int(first.line or 0),
+                                kind="indirect",
+                                status="quota_rank_indirect_violation",
+                                severity="violation",
+                                message=(
+                                    "Indirect logical dependency crosses a Quota Rank Adjacency Rule break. "
+                                    f"Broken edge: {broken.source_path}:{broken.line} -> {broken.target_path or broken.target_spec} "
+                                    f"[{_quota_status_label(broken.status)}]. Chain: {chain_text}"
+                                ),
+                            )
+                        )
+
+                stack.append((next_path, next_chain, next_has_break, visited | frozenset({next_path})))
+
+    return tuple(out)
 
 
 def inspect_quota_dependencies(
@@ -2032,6 +2138,9 @@ def inspect_quota_dependencies(
                     continue
                 add_dependency(_make_dependency(unit, target, raw, known_quotas))
 
+    for indirect_dep in _build_quota_indirect_dependencies(dependencies):
+        add_dependency(indirect_dep)
+
     unknown_files = tuple(sorted((unit.rel_path for unit in units if unit.quota is None), key=str.lower))
     return QuotaInspectionResult(
         root=root,
@@ -2050,6 +2159,8 @@ def _quota_status_label(status: str) -> str:
         "same_quota_import": "SAME QUOTA",
         "same_depth_import": "SAME DEPTH",
         "quota_adjacency_violation": "ADJACENCY",
+        "quota_rank_adjacency_violation": "QRAR",
+        "quota_rank_indirect_violation": "INDIRECT QRAR",
         "unknown_quota": "UNKNOWN QUOTA",
         "unresolved": "UNRESOLVED",
         "ok": "OK",
@@ -2162,7 +2273,7 @@ main {{ padding: 18px 42px 18px 18px; overflow: hidden; }}
 .diff-map {{ position: fixed; right: 12px; top: 96px; bottom: 16px; width: 20px; z-index: 20; border: 1px solid var(--border); border-radius: 999px; background: rgba(17,24,39,.88); box-shadow: 0 10px 35px rgba(0,0,0,.35); overflow: hidden; }}
 .diff-map-marker {{ position: absolute; left: 3px; right: 3px; min-height: 5px; border-radius: 999px; cursor: pointer; opacity: .95; border: 1px solid rgba(0,0,0,.35); }}
 .diff-map-marker:hover {{ left: 1px; right: 1px; opacity: 1; }}
-.diff-map-marker.upward_import, .diff-map-marker.same_quota_import, .diff-map-marker.same_depth_import, .diff-map-marker.quota_adjacency_violation {{ background: var(--bad); }}
+.diff-map-marker.upward_import, .diff-map-marker.same_quota_import, .diff-map-marker.same_depth_import, .diff-map-marker.quota_adjacency_violation, .diff-map-marker.quota_rank_adjacency_violation, .diff-map-marker.quota_rank_indirect_violation {{ background: var(--bad); }}
 .diff-map-marker.unknown_quota, .diff-map-marker.unresolved {{ background: var(--warn); }}
 .diff-map-marker.active {{ outline: 2px solid #ffffff; outline-offset: 1px; }}
 .file-block {{ margin: 0 0 18px; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; background: var(--panel); box-shadow: 0 12px 40px rgba(0,0,0,.25); }}
@@ -3671,7 +3782,7 @@ class DumpItApp(tk.Tk):
             text=(
                 "Static dependency check for Quota Development. "
                 "Python and JavaScript imports are resolved against included project files. "
-                "Violations: same-quota import, same-depth import, upward import, quota adjacency break. "
+                "Violations: same-rank import, upward import, Quota Rank Adjacency Rule break, indirect logical QRAR break. "
                 "Report output is HTML, same style as Diff."
             ),
             wraplength=820,
@@ -3776,7 +3887,7 @@ class DumpItApp(tk.Tk):
             f"Checked {result.checked_files} operational files: Python {result.python_files}, JS {result.js_files}. "
             f"Quota files {result.quota_files}, unknown quota files {len(result.unknown_quota_files)}. "
             f"Violations {len(result.violations)}, warnings {len(result.warnings)}. "
-            "Export include/exclude settings are used; test files are ignored as violation sources; Quota Adjacency Rule is enforced."
+            "Export include/exclude settings are used; test files are ignored as violation sources; Quota Rank Adjacency Rule and indirect logical dependency checks are enforced."
         )
         self.lbl_quota_status.configure(text=status)
         self._log(f"Quota Inspector: {status}")
