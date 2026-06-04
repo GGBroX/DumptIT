@@ -45,6 +45,38 @@ DEFAULT_QUOTA_PATH_RULES = ""
 QUOTA_TEST_DIR_NAMES = {"test", "tests", "__tests__", "spec", "specs"}
 
 
+LIGHT_THEME_COLORS = {
+    "bg": "#f0f0f0",
+    "panel": "#f0f0f0",
+    "panel_2": "#ffffff",
+    "fg": "#000000",
+    "muted": "#4b5563",
+    "border": "#c9c9c9",
+    "entry_bg": "#ffffff",
+    "button_bg": "#f3f4f6",
+    "button_active": "#e5e7eb",
+    "tab_bg": "#e5e7eb",
+    "accent": "#2563eb",
+    "select_bg": "#2563eb",
+    "select_fg": "#ffffff",
+}
+
+DARK_THEME_COLORS = {
+    "bg": "#0f172a",
+    "panel": "#111827",
+    "panel_2": "#1f2937",
+    "fg": "#e5e7eb",
+    "muted": "#9ca3af",
+    "border": "#374151",
+    "entry_bg": "#020617",
+    "button_bg": "#1f2937",
+    "button_active": "#374151",
+    "tab_bg": "#111827",
+    "accent": "#3b82f6",
+    "select_bg": "#2563eb",
+    "select_fg": "#ffffff",
+}
+
 
 def get_default_project_dir() -> Path:
     # Se è un exe (PyInstaller), usa la cartella dell'exe; altrimenti cwd
@@ -113,6 +145,73 @@ def cleanup_quota_temp_html_files() -> tuple[int, int]:
         except Exception:
             failed += 1
     return deleted, failed
+
+
+def is_os_dark_mode_enabled() -> bool:
+    """Best-effort OS app theme detection.
+
+    Windows: reads AppsUseLightTheme from the user theme registry key.
+    macOS: reads AppleInterfaceStyle.
+    Linux: checks common GTK/GNOME dark-theme hints.
+    Unknown/unsupported systems default to light mode.
+    """
+    system = platform.system().lower()
+
+    if system.startswith("win"):
+        try:
+            import winreg  # type: ignore
+
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                value, _type = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return int(value) == 0
+        except Exception:
+            return False
+
+    if system == "darwin":
+        try:
+            proc = subprocess.run(
+                ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            return "dark" in (proc.stdout or "").strip().lower()
+        except Exception:
+            return False
+
+    # Linux / BSD best effort.
+    for env_name in ("GTK_THEME", "QT_STYLE_OVERRIDE", "XDG_CURRENT_DESKTOP"):
+        value = os.environ.get(env_name, "")
+        if "dark" in value.lower():
+            return True
+
+    try:
+        proc = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        if "dark" in (proc.stdout or "").lower():
+            return True
+    except Exception:
+        pass
+
+    try:
+        proc = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        return "dark" in (proc.stdout or "").lower()
+    except Exception:
+        return False
+
 
 
 def _normalize_patch_raw_path(raw: str) -> str:
@@ -2106,6 +2205,9 @@ class DumpItApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("DumpIt — Source Exporter")
+        self._dark_mode_enabled = is_os_dark_mode_enabled()
+        self._theme_colors = DARK_THEME_COLORS if self._dark_mode_enabled else LIGHT_THEME_COLORS
+        self._configure_tk_theme()
 
         # Base safe size
         self.geometry("980x680")
@@ -2175,6 +2277,7 @@ class DumpItApp(tk.Tk):
         self._last_quota_result: QuotaInspectionResult | None = None
 
         self._build_ui()
+        self._apply_non_ttk_widget_theme()
         self.patch_target_dir.trace_add("write", lambda *_args: self._refresh_apply_patch_target())
         self.patch_file.trace_add("write", lambda *_args: self._refresh_apply_patch_target())
         self._cleanup_diff_temp_html(log=True)
@@ -2191,6 +2294,123 @@ class DumpItApp(tk.Tk):
         self.after(0, self._apply_dynamic_min_size)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _configure_tk_theme(self) -> None:
+        """Apply a Tk/ttk theme that follows the OS app dark-mode setting."""
+        colors = getattr(self, "_theme_colors", LIGHT_THEME_COLORS)
+        try:
+            self.configure(bg=colors["bg"])
+        except Exception:
+            pass
+
+        # Tk classic widgets inherit these defaults. ttk widgets are styled below.
+        for pattern, value in (
+            ("*Background", colors["bg"]),
+            ("*Foreground", colors["fg"]),
+            ("*Entry.Background", colors["entry_bg"]),
+            ("*Entry.Foreground", colors["fg"]),
+            ("*Text.Background", colors["entry_bg"]),
+            ("*Text.Foreground", colors["fg"]),
+            ("*Listbox.Background", colors["entry_bg"]),
+            ("*Listbox.Foreground", colors["fg"]),
+            ("*selectBackground", colors["select_bg"]),
+            ("*selectForeground", colors["select_fg"]),
+        ):
+            try:
+                self.option_add(pattern, value)
+            except Exception:
+                pass
+
+        style = ttk.Style(self)
+        self._ttk_style = style
+
+        if not getattr(self, "_dark_mode_enabled", False):
+            return
+
+        try:
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(".", background=colors["bg"], foreground=colors["fg"], fieldbackground=colors["entry_bg"])
+        style.configure("TFrame", background=colors["bg"])
+        style.configure("TLabel", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TLabelframe", background=colors["bg"], foreground=colors["fg"], bordercolor=colors["border"], relief="solid")
+        style.configure("TLabelframe.Label", background=colors["bg"], foreground=colors["fg"])
+        style.configure("TButton", background=colors["button_bg"], foreground=colors["fg"], bordercolor=colors["border"], focusthickness=1, focuscolor=colors["accent"])
+        style.map(
+            "TButton",
+            background=[("active", colors["button_active"]), ("pressed", colors["button_active"]), ("disabled", colors["panel"])],
+            foreground=[("disabled", colors["muted"])],
+        )
+        style.configure("TEntry", fieldbackground=colors["entry_bg"], foreground=colors["fg"], insertcolor=colors["fg"], bordercolor=colors["border"], lightcolor=colors["border"], darkcolor=colors["border"])
+        style.map(
+            "TEntry",
+            fieldbackground=[("disabled", colors["panel"]), ("readonly", colors["entry_bg"])],
+            foreground=[("disabled", colors["muted"])],
+        )
+        style.configure("TCombobox", fieldbackground=colors["entry_bg"], background=colors["button_bg"], foreground=colors["fg"], arrowcolor=colors["fg"], bordercolor=colors["border"])
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", colors["entry_bg"]), ("disabled", colors["panel"])],
+            selectbackground=[("readonly", colors["entry_bg"])],
+            selectforeground=[("readonly", colors["fg"])],
+            foreground=[("disabled", colors["muted"])],
+        )
+        style.configure("TCheckbutton", background=colors["bg"], foreground=colors["fg"])
+        style.map(
+            "TCheckbutton",
+            background=[("active", colors["bg"]), ("disabled", colors["bg"])],
+            foreground=[("disabled", colors["muted"])],
+        )
+        style.configure("TRadiobutton", background=colors["bg"], foreground=colors["fg"])
+        style.map(
+            "TRadiobutton",
+            background=[("active", colors["bg"]), ("disabled", colors["bg"])],
+            foreground=[("disabled", colors["muted"])],
+        )
+        style.configure("TNotebook", background=colors["bg"], borderwidth=0)
+        style.configure("TNotebook.Tab", background=colors["tab_bg"], foreground=colors["muted"], padding=(10, 5), bordercolor=colors["border"])
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", colors["panel_2"]), ("active", colors["button_active"])],
+            foreground=[("selected", colors["fg"]), ("active", colors["fg"])],
+        )
+        for style_name in ("Vertical.TScrollbar", "Horizontal.TScrollbar", "TScrollbar"):
+            style.configure(style_name, background=colors["button_bg"], troughcolor=colors["panel"], bordercolor=colors["border"], arrowcolor=colors["fg"])
+            style.map(style_name, background=[("active", colors["button_active"])])
+
+    def _apply_non_ttk_widget_theme(self) -> None:
+        if not getattr(self, "_dark_mode_enabled", False):
+            return
+        colors = getattr(self, "_theme_colors", DARK_THEME_COLORS)
+
+        if hasattr(self, "log"):
+            try:
+                self.log.configure(
+                    background=colors["entry_bg"],
+                    foreground=colors["fg"],
+                    insertbackground=colors["fg"],
+                    selectbackground=colors["select_bg"],
+                    selectforeground=colors["select_fg"],
+                    highlightbackground=colors["border"],
+                    highlightcolor=colors["accent"],
+                    borderwidth=1,
+                    relief="solid",
+                )
+            except Exception:
+                pass
+
+        if hasattr(self, "batch_canvas"):
+            try:
+                self.batch_canvas.configure(
+                    background=colors["bg"],
+                    highlightbackground=colors["border"],
+                    highlightcolor=colors["accent"],
+                )
+            except Exception:
+                pass
 
     def _apply_dynamic_min_size(self) -> None:
         self.update_idletasks()
@@ -2869,6 +3089,13 @@ class DumpItApp(tk.Tk):
         self._cleanup_diff_temp_html(log=True)
         self._cleanup_quota_temp_html(log=True)
         self.destroy()
+
+    def _cleanup_diff_temp_html(self, log: bool = False) -> None:
+        deleted, failed = cleanup_diff_temp_html_files()
+        if log and (deleted or failed):
+            suffix = f" (failed: {failed})" if failed else ""
+            self._log(f"Diff temp cleanup: deleted {deleted} HTML file(s){suffix}")
+
 
     def _cleanup_quota_temp_html(self, log: bool = False) -> None:
         deleted, failed = cleanup_quota_temp_html_files()
