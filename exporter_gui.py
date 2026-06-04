@@ -40,9 +40,8 @@ DIFF_TEMP_HTML_SUFFIX = ".html"
 TIMESTAMP_FORMAT = "%Y-%m-%d_%H%M%S"
 TIMESTAMP_STEM_RE = re.compile(r"^(?P<base>.+)_\d{4}-\d{2}-\d{2}_\d{6}$")
 DEFAULT_TIMESTAMP_KEEP_OLD = "10"
-DEFAULT_QUOTA_PATTERNS = "*.py,*.js,*.jsx,*.mjs,*.cjs"
-DEFAULT_QUOTA_EXCLUDE_DIRS = DEFAULT_EXCLUDE_DIRS
 DEFAULT_QUOTA_PATH_RULES = ""
+QUOTA_TEST_DIR_NAMES = {"test", "tests", "__tests__", "spec", "specs"}
 
 
 
@@ -1613,6 +1612,15 @@ def _language_for_path(path: Path) -> str | None:
     return None
 
 
+def _is_quota_test_path(rel_path: str) -> bool:
+    parts = [part.lower() for part in rel_path.replace("\\", "/").split("/") if part]
+    if any(part in QUOTA_TEST_DIR_NAMES for part in parts[:-1]):
+        return True
+    name = parts[-1] if parts else ""
+    stem = name.rsplit(".", 1)[0]
+    return bool(stem.startswith("test_") or stem.endswith("_test") or stem.endswith(".test") or stem.endswith(".spec"))
+
+
 def _python_module_name(root: Path, path: Path) -> str:
     rel = path.relative_to(root).as_posix()
     parts = rel.split("/")
@@ -1805,6 +1813,10 @@ def inspect_quota_dependencies(
         if language is None:
             continue
         rel = rel_posix(root, path)
+        if _is_quota_test_path(rel):
+            # Tests are consumers of the system under inspection, not operational quota members.
+            # They may intentionally import same-depth or higher-level objects.
+            continue
         quota, quota_source = detect_quota_for_rel_path(rel, path_rules, auto_detect=auto_detect)
         module_name = _python_module_name(root, path) if language == "python" else rel.rsplit(".", 1)[0].replace("/", ".")
         units.append(
@@ -1824,6 +1836,18 @@ def inspect_quota_dependencies(
     project_python_roots = {name.split(".", 1)[0] for name in python_module_map if name}
 
     dependencies: list[QuotaDependency] = []
+    seen_dependency_keys: set[tuple[str, str, int, str]] = set()
+
+    def add_dependency(dep: QuotaDependency) -> None:
+        if dep.status == "self":
+            return
+        target_key = dep.target_path or dep.target_spec
+        key = (dep.source_path, target_key, int(dep.line or 0), dep.status)
+        if key in seen_dependency_keys:
+            return
+        seen_dependency_keys.add(key)
+        dependencies.append(dep)
+
     for unit in units:
         if unit.language == "python":
             for raw in _extract_python_imports(unit):
@@ -1831,17 +1855,13 @@ def inspect_quota_dependencies(
                 if target is None and not raw.relative and raw.spec.split(".", 1)[0] not in project_python_roots:
                     # external dependency: keep it out of the report to reduce noise.
                     continue
-                dep = _make_dependency(unit, target, raw)
-                if dep.status != "self":
-                    dependencies.append(dep)
+                add_dependency(_make_dependency(unit, target, raw))
         elif unit.language == "javascript":
             for raw in _extract_js_imports(unit):
                 target = _resolve_js_spec(unit, raw.spec, root, js_path_map)
                 if target is None and not raw.relative:
                     continue
-                dep = _make_dependency(unit, target, raw)
-                if dep.status != "self":
-                    dependencies.append(dep)
+                add_dependency(_make_dependency(unit, target, raw))
 
     unknown_files = tuple(sorted((unit.rel_path for unit in units if unit.quota is None), key=str.lower))
     return QuotaInspectionResult(
@@ -2126,8 +2146,6 @@ class DumpItApp(tk.Tk):
         self._patch_drop_ref = None
 
         # Quota Inspector state
-        self.quota_patterns = tk.StringVar(value=DEFAULT_QUOTA_PATTERNS)
-        self.quota_exclude_dirs = tk.StringVar(value=DEFAULT_QUOTA_EXCLUDE_DIRS)
         self.quota_path_rules = tk.StringVar(value=DEFAULT_QUOTA_PATH_RULES)
         self.quota_auto_detect = tk.BooleanVar(value=True)
         self.quota_report_file = tk.StringVar(value="")
@@ -2494,8 +2512,6 @@ class DumpItApp(tk.Tk):
                 "patch_reverse": "False",
                 "patch_backup": "True",
                 "patch_auto_detect": "True",
-                "quota_patterns": DEFAULT_QUOTA_PATTERNS,
-                "quota_exclude_dirs": DEFAULT_QUOTA_EXCLUDE_DIRS,
                 "quota_path_rules": DEFAULT_QUOTA_PATH_RULES,
                 "quota_auto_detect": "True",
                 "quota_report_file": "",
@@ -2562,8 +2578,6 @@ class DumpItApp(tk.Tk):
                 "patch_reverse": "False",
                 "patch_backup": "True",
                 "patch_auto_detect": "True",
-                "quota_patterns": DEFAULT_QUOTA_PATTERNS,
-                "quota_exclude_dirs": DEFAULT_QUOTA_EXCLUDE_DIRS,
                 "quota_path_rules": DEFAULT_QUOTA_PATH_RULES,
                 "quota_auto_detect": "True",
                 "quota_report_file": "",
@@ -2594,8 +2608,6 @@ class DumpItApp(tk.Tk):
             self.patch_reverse.set(s.getboolean("patch_reverse", fallback=False))
             self.patch_backup.set(s.getboolean("patch_backup", fallback=True))
             self.patch_auto_detect.set(s.getboolean("patch_auto_detect", fallback=True))
-            self.quota_patterns.set(s.get("quota_patterns", DEFAULT_QUOTA_PATTERNS))
-            self.quota_exclude_dirs.set(s.get("quota_exclude_dirs", DEFAULT_QUOTA_EXCLUDE_DIRS))
             self.quota_path_rules.set(s.get("quota_path_rules", DEFAULT_QUOTA_PATH_RULES))
             self.quota_auto_detect.set(s.getboolean("quota_auto_detect", fallback=True))
             self.quota_report_file.set(normalize_ui_path(s.get("quota_report_file", "")))
@@ -2631,8 +2643,6 @@ class DumpItApp(tk.Tk):
         self._cp[sec_real]["patch_reverse"] = str(self.patch_reverse.get())
         self._cp[sec_real]["patch_backup"] = str(self.patch_backup.get())
         self._cp[sec_real]["patch_auto_detect"] = str(self.patch_auto_detect.get())
-        self._cp[sec_real]["quota_patterns"] = self.quota_patterns.get()
-        self._cp[sec_real]["quota_exclude_dirs"] = self.quota_exclude_dirs.get()
         self._cp[sec_real]["quota_path_rules"] = self.quota_path_rules.get()
         self._cp[sec_real]["quota_auto_detect"] = str(self.quota_auto_detect.get())
         self._cp[sec_real]["quota_report_file"] = normalize_ui_path(self.quota_report_file.get())
@@ -2818,8 +2828,6 @@ class DumpItApp(tk.Tk):
         self.patch_reverse.set(False)
         self.patch_backup.set(True)
         self.patch_auto_detect.set(True)
-        self.quota_patterns.set(DEFAULT_QUOTA_PATTERNS)
-        self.quota_exclude_dirs.set(DEFAULT_QUOTA_EXCLUDE_DIRS)
         self.quota_path_rules.set(DEFAULT_QUOTA_PATH_RULES)
         self.quota_auto_detect.set(True)
         self.quota_report_file.set("")
@@ -3355,7 +3363,7 @@ class DumpItApp(tk.Tk):
 
     # ---------- Quota Inspector UI / Runner ----------
     def _build_quota_tab(self, parent: ttk.Frame, pad: dict) -> None:
-        info = ttk.LabelFrame(parent, text="Quota Inspector")
+        info = ttk.LabelFrame(parent, text="Quota Inspector — uses Export profile filters")
         info.pack(fill="both", expand=True, **pad)
 
         desc = ttk.Label(
@@ -3371,13 +3379,18 @@ class DumpItApp(tk.Tk):
         )
         desc.pack(fill="x", padx=8, pady=(8, 4))
 
-        patterns_frame = ttk.LabelFrame(info, text="Included source patterns")
-        patterns_frame.pack(fill="x", padx=8, pady=6)
-        ttk.Entry(patterns_frame, textvariable=self.quota_patterns).pack(fill="x", padx=8, pady=8)
-
-        exclude_frame = ttk.LabelFrame(info, text="Exclude folders")
-        exclude_frame.pack(fill="x", padx=8, pady=6)
-        ttk.Entry(exclude_frame, textvariable=self.quota_exclude_dirs).pack(fill="x", padx=8, pady=8)
+        inherited_frame = ttk.LabelFrame(info, text="Source selection inherited from current Export profile")
+        inherited_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Label(
+            inherited_frame,
+            text=(
+                "Uses Export tab > current profile > Project folder, Include patterns, and Exclude folders. "
+                "The inspector only analyzes Python/JavaScript files from that selection. "
+                "Test files/folders are ignored as violation sources."
+            ),
+            wraplength=820,
+            justify="left",
+        ).pack(fill="x", padx=8, pady=8)
 
         rules_frame = ttk.LabelFrame(info, text="Optional path quota rules: path/prefix=Quota, comma-separated")
         rules_frame.pack(fill="x", padx=8, pady=6)
@@ -3440,10 +3453,10 @@ class DumpItApp(tk.Tk):
         root = Path(normalize_ui_path(self.project_dir.get())).resolve()
         if not root.exists():
             raise FileNotFoundError("Project folder does not exist.")
-        patterns = normalize_patterns(parse_csv_list(self.quota_patterns.get()))
+        patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
         if not patterns:
-            raise ValueError("Quota source patterns cannot be empty.")
-        exclude_dirs = {x.lower() for x in parse_csv_list(self.quota_exclude_dirs.get())}
+            raise ValueError("Export include patterns cannot be empty.")
+        exclude_dirs = {x.lower() for x in parse_csv_list(self.exclude_dirs.get())}
         rules = parse_quota_path_rules(self.quota_path_rules.get())
         return root, patterns, exclude_dirs, rules, bool(self.quota_auto_detect.get())
 
@@ -3459,9 +3472,10 @@ class DumpItApp(tk.Tk):
         )
         self._last_quota_result = result
         status = (
-            f"Checked {result.checked_files} files: Python {result.python_files}, JS {result.js_files}. "
+            f"Checked {result.checked_files} operational files: Python {result.python_files}, JS {result.js_files}. "
             f"Quota files {result.quota_files}, unknown quota files {len(result.unknown_quota_files)}. "
-            f"Violations {len(result.violations)}, warnings {len(result.warnings)}."
+            f"Violations {len(result.violations)}, warnings {len(result.warnings)}. "
+            "Export include/exclude settings are used; test files are ignored as violation sources."
         )
         self.lbl_quota_status.configure(text=status)
         self._log(f"Quota Inspector: {status}")
