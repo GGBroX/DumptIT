@@ -1884,7 +1884,41 @@ def _resolve_js_spec(unit: QuotaSourceUnit, spec: str, root: Path, js_path_map: 
     return None
 
 
-def _dependency_status(source: QuotaSourceUnit, target: QuotaSourceUnit | None, raw: _RawImport) -> tuple[str, str, str]:
+def _known_quota_refs(units: list[QuotaSourceUnit]) -> tuple[QuotaRef, ...]:
+    by_label: dict[str, QuotaRef] = {}
+    for unit in units:
+        if unit.quota is not None:
+            by_label.setdefault(unit.quota.label, unit.quota)
+    return tuple(sorted(by_label.values(), key=lambda item: (item.rank, item.family, item.label)))
+
+
+def _expected_adjacent_target_rank(source_quota: QuotaRef, known_quotas: tuple[QuotaRef, ...]) -> int:
+    # Subquotes are local foundations of their parent quota. If a lower subquote
+    # exists under the same family/number, it becomes the immediate neighbor.
+    lower_same_base = [
+        int(item.rank)
+        for item in known_quotas
+        if item.family == source_quota.family
+        and item.number == source_quota.number
+        and int(item.rank) < int(source_quota.rank)
+    ]
+    if lower_same_base:
+        return max(lower_same_base)
+    return (int(source_quota.number) - 1) * 1000
+
+
+def _is_quota_adjacent_dependency(source_quota: QuotaRef, target_quota: QuotaRef, known_quotas: tuple[QuotaRef, ...]) -> bool:
+    if int(target_quota.rank) >= int(source_quota.rank):
+        return False
+    return int(target_quota.rank) == _expected_adjacent_target_rank(source_quota, known_quotas)
+
+
+def _dependency_status(
+    source: QuotaSourceUnit,
+    target: QuotaSourceUnit | None,
+    raw: _RawImport,
+    known_quotas: tuple[QuotaRef, ...] = (),
+) -> tuple[str, str, str]:
     if target is None:
         if raw.relative:
             return "unresolved", "warning", "Local import target was not resolved."
@@ -1899,11 +1933,23 @@ def _dependency_status(source: QuotaSourceUnit, target: QuotaSourceUnit | None, 
         if target.quota.label == source.quota.label:
             return "same_quota_import", "violation", "Source imports another member of the same quota."
         return "same_depth_import", "violation", "Source imports another quota at the same dependency depth."
-    return "ok", "ok", "Downward dependency."
+    if not _is_quota_adjacent_dependency(source.quota, target.quota, known_quotas):
+        expected_rank = _expected_adjacent_target_rank(source.quota, known_quotas)
+        return (
+            "quota_adjacency_violation",
+            "violation",
+            f"Quota Adjacency Rule broken: source may import only the immediately underlying quota rank ({expected_rank}).",
+        )
+    return "ok", "ok", "Adjacent downward dependency."
 
 
-def _make_dependency(source: QuotaSourceUnit, target: QuotaSourceUnit | None, raw: _RawImport) -> QuotaDependency:
-    status, severity, message = _dependency_status(source, target, raw)
+def _make_dependency(
+    source: QuotaSourceUnit,
+    target: QuotaSourceUnit | None,
+    raw: _RawImport,
+    known_quotas: tuple[QuotaRef, ...] = (),
+) -> QuotaDependency:
+    status, severity, message = _dependency_status(source, target, raw, known_quotas)
     return QuotaDependency(
         source_path=source.rel_path,
         source_quota=source.quota.label if source.quota else "?",
@@ -1956,6 +2002,7 @@ def inspect_quota_dependencies(
     python_module_map = _build_python_module_map(units)
     js_path_map = _build_js_path_map(units)
     project_python_roots = {name.split(".", 1)[0] for name in python_module_map if name}
+    known_quotas = _known_quota_refs(units)
 
     dependencies: list[QuotaDependency] = []
     seen_dependency_keys: set[tuple[str, str, int, str]] = set()
@@ -1977,13 +2024,13 @@ def inspect_quota_dependencies(
                 if target is None and not raw.relative and raw.spec.split(".", 1)[0] not in project_python_roots:
                     # external dependency: keep it out of the report to reduce noise.
                     continue
-                add_dependency(_make_dependency(unit, target, raw))
+                add_dependency(_make_dependency(unit, target, raw, known_quotas))
         elif unit.language == "javascript":
             for raw in _extract_js_imports(unit):
                 target = _resolve_js_spec(unit, raw.spec, root, js_path_map)
                 if target is None and not raw.relative:
                     continue
-                add_dependency(_make_dependency(unit, target, raw))
+                add_dependency(_make_dependency(unit, target, raw, known_quotas))
 
     unknown_files = tuple(sorted((unit.rel_path for unit in units if unit.quota is None), key=str.lower))
     return QuotaInspectionResult(
@@ -2002,6 +2049,7 @@ def _quota_status_label(status: str) -> str:
         "upward_import": "UPWARD",
         "same_quota_import": "SAME QUOTA",
         "same_depth_import": "SAME DEPTH",
+        "quota_adjacency_violation": "ADJACENCY",
         "unknown_quota": "UNKNOWN QUOTA",
         "unresolved": "UNRESOLVED",
         "ok": "OK",
@@ -2114,7 +2162,7 @@ main {{ padding: 18px 42px 18px 18px; overflow: hidden; }}
 .diff-map {{ position: fixed; right: 12px; top: 96px; bottom: 16px; width: 20px; z-index: 20; border: 1px solid var(--border); border-radius: 999px; background: rgba(17,24,39,.88); box-shadow: 0 10px 35px rgba(0,0,0,.35); overflow: hidden; }}
 .diff-map-marker {{ position: absolute; left: 3px; right: 3px; min-height: 5px; border-radius: 999px; cursor: pointer; opacity: .95; border: 1px solid rgba(0,0,0,.35); }}
 .diff-map-marker:hover {{ left: 1px; right: 1px; opacity: 1; }}
-.diff-map-marker.upward_import, .diff-map-marker.same_quota_import, .diff-map-marker.same_depth_import {{ background: var(--bad); }}
+.diff-map-marker.upward_import, .diff-map-marker.same_quota_import, .diff-map-marker.same_depth_import, .diff-map-marker.quota_adjacency_violation {{ background: var(--bad); }}
 .diff-map-marker.unknown_quota, .diff-map-marker.unresolved {{ background: var(--warn); }}
 .diff-map-marker.active {{ outline: 2px solid #ffffff; outline-offset: 1px; }}
 .file-block {{ margin: 0 0 18px; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; background: var(--panel); box-shadow: 0 12px 40px rgba(0,0,0,.25); }}
@@ -3623,7 +3671,7 @@ class DumpItApp(tk.Tk):
             text=(
                 "Static dependency check for Quota Development. "
                 "Python and JavaScript imports are resolved against included project files. "
-                "Violations: same-quota import, same-depth import, upward import. "
+                "Violations: same-quota import, same-depth import, upward import, quota adjacency break. "
                 "Report output is HTML, same style as Diff."
             ),
             wraplength=820,
@@ -3728,7 +3776,7 @@ class DumpItApp(tk.Tk):
             f"Checked {result.checked_files} operational files: Python {result.python_files}, JS {result.js_files}. "
             f"Quota files {result.quota_files}, unknown quota files {len(result.unknown_quota_files)}. "
             f"Violations {len(result.violations)}, warnings {len(result.warnings)}. "
-            "Export include/exclude settings are used; test files are ignored as violation sources."
+            "Export include/exclude settings are used; test files are ignored as violation sources; Quota Adjacency Rule is enforced."
         )
         self.lbl_quota_status.configure(text=status)
         self._log(f"Quota Inspector: {status}")
