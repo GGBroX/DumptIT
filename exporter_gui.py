@@ -1150,12 +1150,73 @@ def sanitize_profile_name(name: str) -> str:
 
 DUMP_FILE_HEADER_PREFIX = "===== FILE: "
 DUMP_FILE_HEADER_SUFFIX = " ====="
+DUMP_ROOT_PREFIX = "root:"
+WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 @dataclass(slots=True)
 class DumpSnapshot:
     source: Path
     files: dict[str, str]
+
+
+@dataclass(slots=True, frozen=True)
+class DumpImportEntry:
+    source_header_path: str
+    rel_path: str
+    target_path: Path
+    text: str
+    exists: bool
+    action: str
+
+
+@dataclass(slots=True, frozen=True)
+class DumpImportSkippedEntry:
+    source_header_path: str
+    reason: str
+
+
+@dataclass(slots=True)
+class DumpImportPlan:
+    dump_path: Path
+    target_root: Path
+    source_root: str
+    entries: tuple[DumpImportEntry, ...]
+    skipped: tuple[DumpImportSkippedEntry, ...]
+
+    @property
+    def create_count(self) -> int:
+        return sum(1 for entry in self.entries if entry.action == "create")
+
+    @property
+    def overwrite_count(self) -> int:
+        return sum(1 for entry in self.entries if entry.action == "overwrite")
+
+    @property
+    def skip_existing_count(self) -> int:
+        return sum(1 for entry in self.entries if entry.action == "skip_existing")
+
+    @property
+    def write_count(self) -> int:
+        return self.create_count + self.overwrite_count
+
+    @property
+    def total_count(self) -> int:
+        return len(self.entries) + len(self.skipped)
+
+
+@dataclass(slots=True, frozen=True)
+class DumpImportResult:
+    created: int
+    overwritten: int
+    skipped_existing: int
+    skipped_invalid: int
+    backed_up: int
+    backup_root: Path | None
+
+    @property
+    def written(self) -> int:
+        return int(self.created) + int(self.overwritten)
 
 
 @dataclass(slots=True)
@@ -1217,6 +1278,175 @@ def parse_dump_text(source: Path, text: str) -> DumpSnapshot:
     if not files:
         raise ValueError(f"No DumpIt file sections found in: {source}")
     return DumpSnapshot(source=source, files=files)
+
+
+
+def extract_dump_root_from_text(text: str) -> str:
+    for line in text.splitlines():
+        raw = line.strip()
+        if raw.startswith(DUMP_ROOT_PREFIX):
+            return raw[len(DUMP_ROOT_PREFIX):].strip()
+        if raw.startswith(DUMP_FILE_HEADER_PREFIX):
+            break
+    return ""
+
+
+def _normalize_dump_path_string(raw: str) -> str:
+    value = str(raw or "").strip()
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    return value.replace("\\", "/").strip()
+
+
+def _is_absolute_dump_path(raw: str) -> bool:
+    value = _normalize_dump_path_string(raw)
+    return bool(
+        value.startswith("/")
+        or value.startswith("//")
+        or value.startswith("\\")
+        or WINDOWS_DRIVE_PATH_RE.match(value)
+    )
+
+
+def _dump_header_path_to_relative(header_path: str, dump_root: str) -> tuple[str | None, str]:
+    raw = _normalize_dump_path_string(header_path)
+    root = _normalize_dump_path_string(dump_root).rstrip("/")
+
+    if root:
+        raw_cmp = raw.lower()
+        root_cmp = root.lower()
+        if raw_cmp == root_cmp:
+            return None, "header path points to dump root, not to a file"
+        if raw_cmp.startswith(root_cmp + "/"):
+            raw = raw[len(root):].lstrip("/")
+
+    if _is_absolute_dump_path(raw):
+        return None, "absolute path is outside or not relative to dump root"
+
+    while raw.startswith("./"):
+        raw = raw[2:]
+
+    parts = [part for part in raw.split("/") if part not in {"", "."}]
+    if not parts:
+        return None, "empty relative path"
+    if any(part == ".." for part in parts):
+        return None, "path traversal is not allowed"
+    if any("\x00" in part for part in parts):
+        return None, "path contains NUL byte"
+    if any(":" in part for part in parts):
+        return None, "path contains unsupported ':' character"
+
+    return "/".join(parts), ""
+
+
+def build_dump_import_plan(
+    *,
+    dump_path: Path,
+    target_root: Path,
+    overwrite_existing: bool,
+) -> DumpImportPlan:
+    dump_text = read_text_safely(dump_path)
+    snapshot = parse_dump_text(dump_path, dump_text)
+    source_root = extract_dump_root_from_text(dump_text)
+
+    entries: list[DumpImportEntry] = []
+    skipped: list[DumpImportSkippedEntry] = []
+    seen_rel_paths: set[str] = set()
+
+    for header_path, content in snapshot.files.items():
+        rel_path, reason = _dump_header_path_to_relative(header_path, source_root)
+        if not rel_path:
+            skipped.append(DumpImportSkippedEntry(source_header_path=header_path, reason=reason or "invalid path"))
+            continue
+
+        rel_key = rel_path.lower()
+        if rel_key in seen_rel_paths:
+            skipped.append(DumpImportSkippedEntry(source_header_path=header_path, reason=f"duplicate dump path after normalization: {rel_path}"))
+            continue
+        seen_rel_paths.add(rel_key)
+
+        target_path = target_root.joinpath(*rel_path.split("/"))
+        try:
+            exists = target_path.exists()
+            if exists and target_path.is_dir():
+                skipped.append(DumpImportSkippedEntry(source_header_path=header_path, reason=f"target path is an existing directory: {rel_path}"))
+                continue
+        except OSError as exc:
+            skipped.append(DumpImportSkippedEntry(source_header_path=header_path, reason=f"target path cannot be checked: {exc}"))
+            continue
+
+        action = "create"
+        if exists:
+            action = "overwrite" if overwrite_existing else "skip_existing"
+
+        entries.append(
+            DumpImportEntry(
+                source_header_path=header_path,
+                rel_path=rel_path,
+                target_path=target_path,
+                text=content,
+                exists=bool(exists),
+                action=action,
+            )
+        )
+
+    return DumpImportPlan(
+        dump_path=dump_path,
+        target_root=target_root,
+        source_root=source_root,
+        entries=tuple(entries),
+        skipped=tuple(skipped),
+    )
+
+
+def execute_dump_import_plan(
+    plan: DumpImportPlan,
+    *,
+    overwrite_existing: bool,
+    backup_overwritten: bool,
+) -> DumpImportResult:
+    created = 0
+    overwritten = 0
+    skipped_existing = 0
+    backed_up = 0
+    backup_root: Path | None = None
+
+    if backup_overwritten and any(entry.action == "overwrite" for entry in plan.entries):
+        backup_root = plan.target_root / ".dumpit_import_backup" / datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for entry in plan.entries:
+        if entry.action == "skip_existing":
+            skipped_existing += 1
+            continue
+
+        exists = entry.target_path.exists()
+        if exists and not overwrite_existing:
+            skipped_existing += 1
+            continue
+        if exists and entry.target_path.is_dir():
+            continue
+
+        if exists and backup_root is not None:
+            backup_path = backup_root.joinpath(*entry.rel_path.split("/"))
+            ensure_parent_dir(backup_path)
+            shutil.copy2(entry.target_path, backup_path)
+            backed_up += 1
+
+        ensure_parent_dir(entry.target_path)
+        entry.target_path.write_text(entry.text, encoding="utf-8")
+        if exists:
+            overwritten += 1
+        else:
+            created += 1
+
+    return DumpImportResult(
+        created=created,
+        overwritten=overwritten,
+        skipped_existing=skipped_existing,
+        skipped_invalid=len(plan.skipped),
+        backed_up=backed_up,
+        backup_root=backup_root,
+    )
 
 
 def compare_dump_snapshots(old: DumpSnapshot, new: DumpSnapshot) -> DumpDiffResult:
@@ -2389,6 +2619,13 @@ class DumpItApp(tk.Tk):
         self.config_path = get_config_path()
         self._active_profile = "Default"
 
+        # Import settings (per profile)
+        self.import_dump_file = tk.StringVar(value="")
+        self.import_target_dir = tk.StringVar(value="")
+        self.import_overwrite = tk.BooleanVar(value=True)
+        self.import_backup = tk.BooleanVar(value=True)
+        self._last_import_plan: DumpImportPlan | None = None
+
         # Watch settings (per profile)
         self.watch_poll_ms = tk.StringVar(value="1500")
         self.watch_quiet_ms = tk.StringVar(value="1200")
@@ -2449,6 +2686,8 @@ class DumpItApp(tk.Tk):
         self._ensure_output_default()
         if not self.patch_target_dir.get().strip():
             self.patch_target_dir.set(normalize_ui_path(self.project_dir.get()))
+        if not self.import_target_dir.get().strip():
+            self.import_target_dir.set(normalize_ui_path(self.project_dir.get()))
 
         self.after(0, self._apply_dynamic_min_size)
 
@@ -2600,6 +2839,7 @@ class DumpItApp(tk.Tk):
         self.nb.pack(fill="both", expand=True, **pad)
 
         self.tab_export = ttk.Frame(self.nb)
+        self.tab_import = ttk.Frame(self.nb)
         self.tab_watch = ttk.Frame(self.nb)
         self.tab_batch = ttk.Frame(self.nb)
         self.tab_diff = ttk.Frame(self.nb)
@@ -2607,6 +2847,7 @@ class DumpItApp(tk.Tk):
         self.tab_quota = ttk.Frame(self.nb)
 
         self.nb.add(self.tab_export, text="Export")
+        self.nb.add(self.tab_import, text="Import")
         self.nb.add(self.tab_watch, text="Watch")
         self.nb.add(self.tab_batch, text="Batch")
         self.nb.add(self.tab_diff, text="Diff")
@@ -2681,6 +2922,9 @@ class DumpItApp(tk.Tk):
         actions.pack(fill="x", **pad)
         ttk.Button(actions, text="Preview", command=self._preview).pack(side="left", padx=4)
         ttk.Button(actions, text="Export", command=self._export).pack(side="left", padx=4)
+
+        # ---------- IMPORT TAB ----------
+        self._build_import_tab(self.tab_import, pad)
 
         # ---------- WATCH TAB ----------
         self._build_watch_tab(self.tab_watch, pad)
@@ -2906,6 +3150,10 @@ class DumpItApp(tk.Tk):
                 "timestamp_keep_old": DEFAULT_TIMESTAMP_KEEP_OLD,
                 "skip_binary": "True",
                 "header_full_path": "False",
+                "import_dump_file": "",
+                "import_target_dir": "",
+                "import_overwrite": "True",
+                "import_backup": "True",
                 "watch_poll_ms": "1500",
                 "watch_quiet_ms": "1200",
                 "watch_export_on_start": "True",
@@ -2972,6 +3220,10 @@ class DumpItApp(tk.Tk):
                 "timestamp_keep_old": DEFAULT_TIMESTAMP_KEEP_OLD,
                 "skip_binary": "True",
                 "header_full_path": "False",
+                "import_dump_file": "",
+                "import_target_dir": "",
+                "import_overwrite": "True",
+                "import_backup": "True",
                 "watch_poll_ms": "1500",
                 "watch_quiet_ms": "1200",
                 "watch_export_on_start": "True",
@@ -3000,6 +3252,11 @@ class DumpItApp(tk.Tk):
             self.header_full_path.set(s.getboolean("header_full_path", fallback=False))
 
             self.output_file.set(normalize_ui_path(s.get("output_file", "")))
+            self.import_dump_file.set(normalize_ui_path(s.get("import_dump_file", "")))
+            import_target = normalize_ui_path(s.get("import_target_dir", ""))
+            self.import_target_dir.set(import_target or normalize_ui_path(self.project_dir.get()))
+            self.import_overwrite.set(s.getboolean("import_overwrite", fallback=True))
+            self.import_backup.set(s.getboolean("import_backup", fallback=True))
             self.watch_poll_ms.set(s.get("watch_poll_ms", "1500"))
             self.watch_quiet_ms.set(s.get("watch_quiet_ms", "1200"))
             self.watch_export_on_start.set(s.getboolean("watch_export_on_start", fallback=True))
@@ -3029,6 +3286,10 @@ class DumpItApp(tk.Tk):
         # project/output per profilo
         self._cp[sec_real]["project_dir"] = normalize_ui_path(self.project_dir.get())
         self._cp[sec_real]["output_file"] = normalize_ui_path(self.output_file.get())
+        self._cp[sec_real]["import_dump_file"] = normalize_ui_path(self.import_dump_file.get())
+        self._cp[sec_real]["import_target_dir"] = normalize_ui_path(self.import_target_dir.get())
+        self._cp[sec_real]["import_overwrite"] = str(self.import_overwrite.get())
+        self._cp[sec_real]["import_backup"] = str(self.import_backup.get())
 
         self._cp[sec_real]["include_patterns"] = self.include_patterns.get()
         self._cp[sec_real]["exclude_dirs"] = self.exclude_dirs.get()
@@ -3222,6 +3483,10 @@ class DumpItApp(tk.Tk):
         self.skip_binary.set(True)
         self.header_full_path.set(False)
         self.output_file.set("")
+        self.import_dump_file.set("")
+        self.import_target_dir.set(normalize_ui_path(self.project_dir.get()))
+        self.import_overwrite.set(True)
+        self.import_backup.set(True)
         self.watch_poll_ms.set("1500")
         self.watch_quiet_ms.set("1200")
         self.watch_export_on_start.set(True)
@@ -3926,6 +4191,205 @@ class DumpItApp(tk.Tk):
             messagebox.showinfo("Quota Inspector", f"Report saved.\nOutput: {out_path}")
         except Exception as e:
             messagebox.showerror("Quota Inspector", str(e))
+
+
+    # ---------- Import UI / Runner ----------
+    def _build_import_tab(self, parent: ttk.Frame, pad: dict) -> None:
+        info = ttk.LabelFrame(parent, text="Import Dump")
+        info.pack(fill="both", expand=True, **pad)
+
+        desc = ttk.Label(
+            info,
+            text=(
+                "Select a DumpIt export file and a target folder. DumpIt recreates the dumped "
+                "relative file tree under the target folder. Extra files already present in the "
+                "target are not deleted. Absolute dump headers are accepted only when they can be "
+                "made relative to the root stored in the dump."
+            ),
+            wraplength=820,
+            justify="left",
+        )
+        desc.pack(fill="x", padx=8, pady=(8, 4))
+
+        dump_frame = ttk.LabelFrame(info, text="Dump file")
+        dump_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(dump_frame, textvariable=self.import_dump_file).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        ttk.Button(dump_frame, text="Browse…", command=self._browse_import_dump_file).pack(side="left", padx=8, pady=8)
+
+        target_frame = ttk.LabelFrame(info, text="Target folder")
+        target_frame.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(target_frame, textvariable=self.import_target_dir).pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        ttk.Button(target_frame, text="Current project", command=lambda: self._set_import_target_to_current_project(log=True)).pack(side="left", padx=4, pady=8)
+        ttk.Button(target_frame, text="Browse…", command=self._browse_import_target_dir).pack(side="left", padx=8, pady=8)
+
+        options = ttk.LabelFrame(info, text="Options")
+        options.pack(fill="x", padx=8, pady=6)
+        opt_grid = ttk.Frame(options)
+        opt_grid.pack(fill="x", padx=8, pady=8)
+        ttk.Checkbutton(
+            opt_grid,
+            text="Overwrite existing files",
+            variable=self.import_overwrite,
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(
+            opt_grid,
+            text="Backup overwritten files to .dumpit_import_backup",
+            variable=self.import_backup,
+        ).grid(row=0, column=1, sticky="w", padx=16, pady=4)
+
+        actions = ttk.Frame(info)
+        actions.pack(fill="x", padx=8, pady=6)
+        ttk.Button(actions, text="Preview import", command=self._preview_dump_import).pack(side="left", padx=4)
+        ttk.Button(actions, text="Import dump", command=self._run_dump_import).pack(side="left", padx=4)
+
+        details = ttk.LabelFrame(info, text="Status")
+        details.pack(fill="both", expand=True, padx=8, pady=(6, 10))
+        self.lbl_import_status = ttk.Label(details, text="No import preview run.", wraplength=820, justify="left")
+        self.lbl_import_status.pack(fill="x", padx=8, pady=8)
+
+    def _browse_import_dump_file(self) -> None:
+        initialdir = str(get_default_project_dir())
+        current = normalize_ui_path(self.import_dump_file.get().strip())
+        if current:
+            try:
+                initialdir = str(Path(current).resolve().parent)
+            except Exception:
+                pass
+
+        f = filedialog.askopenfilename(
+            title="Select DumpIt dump file",
+            initialdir=initialdir,
+            filetypes=[("DumpIt/Text files", "*.txt *.dump"), ("All files", "*.*")],
+        )
+        if f:
+            self.import_dump_file.set(normalize_ui_path(f))
+
+    def _browse_import_target_dir(self) -> None:
+        initialdir = normalize_ui_path(self.import_target_dir.get().strip()) or normalize_ui_path(self.project_dir.get()) or str(get_default_project_dir())
+        d = filedialog.askdirectory(title="Select import target folder", initialdir=initialdir)
+        if d:
+            self.import_target_dir.set(normalize_ui_path(d))
+
+    def _set_import_target_to_current_project(self, log: bool = False) -> None:
+        target = normalize_ui_path(self.project_dir.get().strip()) or str(get_default_project_dir())
+        self.import_target_dir.set(target)
+        if log:
+            self._log(f"Import target set to current project: {target}")
+
+    def _get_import_paths(self) -> tuple[Path, Path]:
+        dump_raw = normalize_ui_path(self.import_dump_file.get().strip())
+        if not dump_raw:
+            raise ValueError("Select a DumpIt dump file.")
+        dump_path = Path(dump_raw).resolve()
+        if not dump_path.exists():
+            raise FileNotFoundError(f"Dump file does not exist: {dump_path}")
+        if not dump_path.is_file():
+            raise ValueError(f"Dump path is not a file: {dump_path}")
+
+        target_raw = normalize_ui_path(self.import_target_dir.get().strip())
+        if not target_raw:
+            raise ValueError("Select a target folder.")
+        target_root = Path(target_raw).resolve()
+        return dump_path, target_root
+
+    def _build_import_plan_from_ui(self) -> DumpImportPlan:
+        dump_path, target_root = self._get_import_paths()
+        if not target_root.exists():
+            if not messagebox.askyesno("Import Dump", f"Target folder does not exist. Create it?\n\n{target_root}"):
+                raise ValueError("Target folder does not exist.")
+            target_root.mkdir(parents=True, exist_ok=True)
+        if not target_root.is_dir():
+            raise ValueError(f"Target path is not a folder: {target_root}")
+
+        plan = build_dump_import_plan(
+            dump_path=dump_path,
+            target_root=target_root,
+            overwrite_existing=bool(self.import_overwrite.get()),
+        )
+        self._last_import_plan = plan
+        return plan
+
+    def _format_import_plan_summary(self, plan: DumpImportPlan) -> str:
+        invalid_sample = ""
+        if plan.skipped:
+            sample_lines = [f"- {item.source_header_path}: {item.reason}" for item in plan.skipped[:8]]
+            if len(plan.skipped) > 8:
+                sample_lines.append(f"- … {len(plan.skipped) - 8} more")
+            invalid_sample = "\n\nSkipped invalid/unsafe paths:\n" + "\n".join(sample_lines)
+
+        source_root = plan.source_root or "not declared"
+        return (
+            f"Dump: {plan.dump_path}\n"
+            f"Dump root: {source_root}\n"
+            f"Target: {plan.target_root}\n"
+            f"Files in dump: {plan.total_count}\n"
+            f"Will create: {plan.create_count}\n"
+            f"Will overwrite: {plan.overwrite_count}\n"
+            f"Will skip existing: {plan.skip_existing_count}\n"
+            f"Skipped invalid/unsafe: {len(plan.skipped)}"
+            f"{invalid_sample}"
+        )
+
+    def _preview_dump_import(self) -> None:
+        try:
+            plan = self._build_import_plan_from_ui()
+            summary = self._format_import_plan_summary(plan)
+            self.lbl_import_status.configure(text=summary)
+            self._save_config(silent=True)
+            self._log(
+                f"Import preview: dump={plan.dump_path}, target={plan.target_root}, "
+                f"create={plan.create_count}, overwrite={plan.overwrite_count}, "
+                f"skip_existing={plan.skip_existing_count}, skipped_invalid={len(plan.skipped)}"
+            )
+        except Exception as e:
+            messagebox.showerror("Import Dump", str(e))
+
+    def _run_dump_import(self) -> None:
+        try:
+            plan = self._build_import_plan_from_ui()
+            summary = self._format_import_plan_summary(plan)
+            self.lbl_import_status.configure(text=summary)
+            if plan.write_count <= 0:
+                messagebox.showinfo("Import Dump", f"No files to write.\n\n{summary}")
+                self._log("Import skipped: no files to write.")
+                return
+
+            if not messagebox.askyesno(
+                "Import Dump",
+                "Write files from this dump to the target folder?\n\n"
+                f"Create: {plan.create_count}\n"
+                f"Overwrite: {plan.overwrite_count}\n"
+                f"Skip existing: {plan.skip_existing_count}\n"
+                f"Skipped invalid/unsafe: {len(plan.skipped)}\n\n"
+                f"Target: {plan.target_root}",
+            ):
+                return
+
+            result = execute_dump_import_plan(
+                plan,
+                overwrite_existing=bool(self.import_overwrite.get()),
+                backup_overwritten=bool(self.import_backup.get()),
+            )
+            backup_text = f"\nBackup: {result.backup_root}" if result.backup_root is not None and result.backed_up else ""
+            final_summary = (
+                f"Import completed.\n"
+                f"Created: {result.created}\n"
+                f"Overwritten: {result.overwritten}\n"
+                f"Skipped existing: {result.skipped_existing}\n"
+                f"Skipped invalid/unsafe: {result.skipped_invalid}\n"
+                f"Backed up: {result.backed_up}"
+                f"{backup_text}"
+            )
+            self.lbl_import_status.configure(text=final_summary)
+            self._save_config(silent=True)
+            self._log(
+                f"Import completed: created={result.created}, overwritten={result.overwritten}, "
+                f"skipped_existing={result.skipped_existing}, skipped_invalid={result.skipped_invalid}, "
+                f"backed_up={result.backed_up}, target={plan.target_root}"
+            )
+            messagebox.showinfo("Import Dump", final_summary)
+        except Exception as e:
+            messagebox.showerror("Import Dump", str(e))
 
 
     def _build_watch_tab(self, parent: ttk.Frame, pad: dict) -> None:
