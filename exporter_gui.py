@@ -2598,9 +2598,9 @@ class DumpItApp(tk.Tk):
         self._theme_colors = DARK_THEME_COLORS if self._dark_mode_enabled else LIGHT_THEME_COLORS
         self._configure_tk_theme()
 
-        # Base safe size
-        self.geometry("980x680")
-        self.minsize(980, 680)
+        # Base compact size
+        self.geometry("1000x650")
+        self.minsize(940, 620)
 
         # State base
         self.project_dir = tk.StringVar(value=str(get_default_project_dir()))
@@ -2819,8 +2819,8 @@ class DumpItApp(tk.Tk):
         req_w = self.winfo_reqwidth() + pad_w
         req_h = self.winfo_reqheight() + pad_h
     
-        min_w = max(980, req_w)
-        min_h = max(680, req_h)
+        min_w = max(940, req_w)
+        min_h = max(620, req_h)
     
         self.minsize(min_w, min_h)
     
@@ -2830,13 +2830,16 @@ class DumpItApp(tk.Tk):
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
-        pad = {"padx": 10, "pady": 6}
+        pad = {"padx": 8, "pady": 4}
         root = ttk.Frame(self)
-        root.pack(fill="both", expand=True, **pad)
+        root.pack(fill="both", expand=True, padx=8, pady=6)
+
+        # Global profile bar: the profile is application scope, not Export scope.
+        self._build_profile_bar(root)
 
         # Tabs
         self.nb = ttk.Notebook(root)
-        self.nb.pack(fill="both", expand=True, **pad)
+        self.nb.pack(fill="both", expand=True, padx=0, pady=(4, 4))
 
         self.tab_export = ttk.Frame(self.nb)
         self.tab_import = ttk.Frame(self.nb)
@@ -2855,73 +2858,7 @@ class DumpItApp(tk.Tk):
         self.nb.add(self.tab_quota, text="Quota")
 
         # ---------- EXPORT TAB ----------
-        export_root = self.tab_export
-
-        # Profiles frame
-        lf0 = ttk.LabelFrame(export_root, text="Profile")
-        lf0.pack(fill="x", **pad)
-        row0 = ttk.Frame(lf0)
-        row0.pack(fill="x", padx=8, pady=8)
-
-        ttk.Label(row0, text="Config:").pack(side="left")
-        self.cb_profiles = ttk.Combobox(row0, textvariable=self.profile_name, state="readonly", width=24)
-        self.cb_profiles.pack(side="left", padx=8)
-        self.cb_profiles.bind("<<ComboboxSelected>>", self._on_profile_selected)
-
-        ttk.Button(row0, text="New…", command=self._profile_new).pack(side="left", padx=4)
-        ttk.Button(row0, text="Rename…", command=self._profile_rename).pack(side="left", padx=4)
-        ttk.Button(row0, text="Delete", command=self._profile_delete).pack(side="left", padx=4)
-
-        # Profile actions (keep near profile selector)
-        row0_actions = ttk.Frame(lf0)
-        row0_actions.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Button(row0_actions, text="Reset defaults", command=self._reset_defaults).pack(side="right", padx=4)
-        ttk.Button(row0_actions, text="Save profile", command=self._save_config).pack(side="right", padx=4)
-
-        # Project folder
-        lf1 = ttk.LabelFrame(export_root, text="Project folder")
-        lf1.pack(fill="x", **pad)
-        ttk.Entry(lf1, textvariable=self.project_dir).pack(side="left", fill="x", expand=True, padx=8, pady=8)
-        ttk.Button(lf1, text="Browse…", command=self._browse_project).pack(side="left", padx=8, pady=8)
-
-        # Include patterns
-        lf2 = ttk.LabelFrame(export_root, text="Include patterns (comma-separated, ex: *.al,app.json,*.gd)")
-        lf2.pack(fill="x", **pad)
-        ttk.Entry(lf2, textvariable=self.include_patterns).pack(fill="x", padx=8, pady=8)
-
-        # Exclude dirs
-        lf3 = ttk.LabelFrame(export_root, text="Exclude folders (comma-separated, match by folder name)")
-        lf3.pack(fill="x", **pad)
-        ttk.Entry(lf3, textvariable=self.exclude_dirs).pack(fill="x", padx=8, pady=8)
-
-        # Output
-        lf4 = ttk.LabelFrame(export_root, text="Output file")
-        lf4.pack(fill="x", **pad)
-        ttk.Entry(lf4, textvariable=self.output_file).pack(side="left", fill="x", expand=True, padx=8, pady=8)
-        ttk.Button(lf4, text="Choose…", command=self._choose_output).pack(side="left", padx=8, pady=8)
-
-        # Options
-        lf5 = ttk.LabelFrame(export_root, text="Options")
-        lf5.pack(fill="x", **pad)
-        opt = ttk.Frame(lf5)
-        opt.pack(fill="x", padx=8, pady=8)
-
-        ttk.Checkbutton(opt, text="Add timestamp to output name", variable=self.add_timestamp,
-                        command=self._suggest_output_if_default).grid(row=0, column=0, sticky="w", padx=6, pady=2)
-        ttk.Checkbutton(opt, text="Skip binary files (recommended)", variable=self.skip_binary).grid(
-            row=0, column=1, sticky="w", padx=6, pady=2
-        )
-        ttk.Label(opt, text="Max old timestamped exports to keep:").grid(row=1, column=0, sticky="w", padx=6, pady=2)
-        ttk.Entry(opt, textvariable=self.timestamp_keep_old, width=8).grid(row=1, column=1, sticky="w", padx=6, pady=2)
-        ttk.Checkbutton(opt, text="Header = full path (instead of relative)", variable=self.header_full_path).grid(
-            row=2, column=0, sticky="w", padx=6, pady=2
-        )
-
-        # Actions
-        actions = ttk.Frame(export_root)
-        actions.pack(fill="x", **pad)
-        ttk.Button(actions, text="Preview", command=self._preview).pack(side="left", padx=4)
-        ttk.Button(actions, text="Export", command=self._export).pack(side="left", padx=4)
+        self._build_export_tab(self.tab_export, pad)
 
         # ---------- IMPORT TAB ----------
         self._build_import_tab(self.tab_import, pad)
@@ -2942,17 +2879,75 @@ class DumpItApp(tk.Tk):
         self._build_quota_tab(self.tab_quota, pad)
 
         # ---------- SHARED LOG ----------
-        self.log = tk.Text(root, height=5, wrap="word")
-        self.log.pack(fill="both", expand=True, **pad)
+        self.log = tk.Text(root, height=4, wrap="word")
+        self.log.pack(fill="x", expand=False, padx=0, pady=(4, 2))
         self.log.configure(state="disabled")
 
         # Footer
         footer = ttk.Frame(root)
-        footer.pack(fill="x", **pad)
+        footer.pack(fill="x", padx=0, pady=(0, 2))
         self.lbl_cfg = ttk.Label(footer, text=f"Config: {self.config_path}")
         self.lbl_cfg.pack(side="left")
 
         self._set_watch_status("Stopped")
+
+    def _build_profile_bar(self, parent: ttk.Frame) -> None:
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", padx=0, pady=(0, 4))
+
+        ttk.Label(bar, text="Profile:").pack(side="left", padx=(0, 6))
+        self.cb_profiles = ttk.Combobox(bar, textvariable=self.profile_name, state="readonly", width=24)
+        self.cb_profiles.pack(side="left", padx=(0, 8))
+        self.cb_profiles.bind("<<ComboboxSelected>>", self._on_profile_selected)
+
+        ttk.Button(bar, text="New…", command=self._profile_new).pack(side="left", padx=2)
+        ttk.Button(bar, text="Rename…", command=self._profile_rename).pack(side="left", padx=2)
+        ttk.Button(bar, text="Delete", command=self._profile_delete).pack(side="left", padx=2)
+
+        ttk.Button(bar, text="Reset defaults", command=self._reset_defaults).pack(side="right", padx=(4, 0))
+        ttk.Button(bar, text="Save profile", command=self._save_config).pack(side="right", padx=4)
+
+    def _build_export_tab(self, parent: ttk.Frame, pad: dict) -> None:
+        export_root = parent
+
+        source = ttk.LabelFrame(export_root, text="Export settings for current profile")
+        source.pack(fill="x", **pad)
+        source.columnconfigure(1, weight=1)
+
+        row_pad = {"padx": 8, "pady": 4}
+        ttk.Label(source, text="Project folder").grid(row=0, column=0, sticky="w", **row_pad)
+        ttk.Entry(source, textvariable=self.project_dir).grid(row=0, column=1, sticky="ew", **row_pad)
+        ttk.Button(source, text="Browse…", command=self._browse_project).grid(row=0, column=2, sticky="e", **row_pad)
+
+        ttk.Label(source, text="Include patterns").grid(row=1, column=0, sticky="w", **row_pad)
+        ttk.Entry(source, textvariable=self.include_patterns).grid(row=1, column=1, columnspan=2, sticky="ew", **row_pad)
+
+        ttk.Label(source, text="Exclude folders").grid(row=2, column=0, sticky="w", **row_pad)
+        ttk.Entry(source, textvariable=self.exclude_dirs).grid(row=2, column=1, columnspan=2, sticky="ew", **row_pad)
+
+        ttk.Label(source, text="Output file").grid(row=3, column=0, sticky="w", **row_pad)
+        ttk.Entry(source, textvariable=self.output_file).grid(row=3, column=1, sticky="ew", **row_pad)
+        ttk.Button(source, text="Choose…", command=self._choose_output).grid(row=3, column=2, sticky="e", **row_pad)
+
+        options = ttk.LabelFrame(export_root, text="Options")
+        options.pack(fill="x", **pad)
+        options.columnconfigure(4, weight=1)
+
+        ttk.Checkbutton(
+            options,
+            text="Timestamp output",
+            variable=self.add_timestamp,
+            command=self._suggest_output_if_default,
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        ttk.Label(options, text="Keep old:").grid(row=0, column=1, sticky="e", padx=(16, 4), pady=4)
+        ttk.Entry(options, textvariable=self.timestamp_keep_old, width=8).grid(row=0, column=2, sticky="w", padx=(0, 12), pady=4)
+        ttk.Checkbutton(options, text="Skip binary", variable=self.skip_binary).grid(row=0, column=3, sticky="w", padx=8, pady=4)
+        ttk.Checkbutton(options, text="Header = full path", variable=self.header_full_path).grid(row=0, column=4, sticky="w", padx=8, pady=4)
+
+        actions = ttk.Frame(export_root)
+        actions.pack(fill="x", padx=8, pady=(4, 0))
+        ttk.Button(actions, text="Preview", command=self._preview).pack(side="left", padx=(0, 4))
+        ttk.Button(actions, text="Export", command=self._export).pack(side="left", padx=4)
 
     def _log(self, msg: str) -> None:
         self.log.configure(state="normal")
