@@ -2264,6 +2264,11 @@ def _build_lowest_available_quota_violations(
     for unit in sorted(units, key=lambda item: item.rel_path.lower()):
         if unit.quota is None:
             continue
+        if unit.path.name == "__init__.py":
+            # Package markers / package surfaces are not operational modules for LAQR.
+            # If they contain explicit internal imports, QRAR may still report those edges,
+            # but they must not be forced down to the lowest quota by LAQR.
+            continue
         source_rank = _quota_rank_number(unit.quota)
         imported_ranks = sorted(imported_ranks_by_source.get(unit.rel_path, set()))
         imported_labels = sorted(imported_labels_by_source.get(unit.rel_path, set()), key=str.lower)
@@ -2474,7 +2479,22 @@ def inspect_quota_dependencies(
     for indirect_dep in _build_quota_indirect_dependencies(dependencies):
         add_dependency(indirect_dep)
 
-    unknown_files = tuple(sorted((unit.rel_path for unit in units if unit.quota is None), key=str.lower))
+    sources_with_relevant_imports = {
+        dep.source_path
+        for dep in dependencies
+        if dep.source_path and dep.status not in {"self", "external"}
+    }
+    unknown_files = tuple(
+        sorted(
+            (
+                unit.rel_path
+                for unit in units
+                if unit.quota is None
+                and not (unit.path.name == "__init__.py" and unit.rel_path not in sources_with_relevant_imports)
+            ),
+            key=str.lower,
+        )
+    )
     return QuotaInspectionResult(
         root=root,
         checked_files=len(units),
