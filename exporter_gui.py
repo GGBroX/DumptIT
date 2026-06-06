@@ -2789,6 +2789,9 @@ class DumpItApp(tk.Tk):
         self.patch_backup = tk.BooleanVar(value=True)
         self.patch_auto_detect = tk.BooleanVar(value=True)
         self._patch_drop_ref = None
+        self._apply_patch_status_text = "No patch checked."
+        self._apply_patch_log_key = ""
+        self._apply_patch_log_lines: list[str] = []
 
         # Quota Inspector state
         self.quota_path_rules = tk.StringVar(value=DEFAULT_QUOTA_PATH_RULES)
@@ -2798,8 +2801,12 @@ class DumpItApp(tk.Tk):
 
         self._build_ui()
         self._apply_non_ttk_widget_theme()
-        self.patch_target_dir.trace_add("write", lambda *_args: self._refresh_apply_patch_target())
-        self.patch_file.trace_add("write", lambda *_args: self._refresh_apply_patch_target())
+        self.patch_target_dir.trace_add("write", lambda *_args: self._on_apply_patch_selection_changed())
+        self.patch_file.trace_add("write", lambda *_args: self._on_apply_patch_selection_changed())
+        self.patch_strip_level.trace_add("write", lambda *_args: self._on_apply_patch_selection_changed())
+        self.patch_reverse.trace_add("write", lambda *_args: self._on_apply_patch_selection_changed())
+        self.patch_auto_detect.trace_add("write", lambda *_args: self._on_apply_patch_selection_changed())
+        self.patch_backup.trace_add("write", lambda *_args: self._on_apply_patch_selection_changed())
         self._cleanup_diff_temp_html(log=True)
         self._cleanup_quota_temp_html(log=True)
         self.after(250, self._enable_patch_file_drop)
@@ -3088,6 +3095,74 @@ class DumpItApp(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(text)
         self._log("Log copied to clipboard.")
+
+    def _current_apply_patch_log_key(self) -> str:
+        try:
+            patch_value = normalize_ui_path(self.patch_file.get().strip())
+        except Exception:
+            patch_value = str(self.patch_file.get() or "").strip()
+        try:
+            target_value = normalize_ui_path(self.patch_target_dir.get().strip())
+        except Exception:
+            target_value = str(self.patch_target_dir.get() or "").strip()
+        return "|".join(
+            (
+                str(self.profile_name.get() or ""),
+                patch_value,
+                target_value,
+                str(self.patch_strip_level.get() or ""),
+                str(bool(self.patch_reverse.get())),
+                str(bool(self.patch_auto_detect.get())),
+                str(bool(self.patch_backup.get())),
+            )
+        )
+
+    def _reset_apply_patch_operation_log(self) -> None:
+        self._apply_patch_log_key = self._current_apply_patch_log_key()
+        self._apply_patch_log_lines = []
+
+    def _on_apply_patch_selection_changed(self) -> None:
+        self._refresh_apply_patch_target()
+        self._reset_apply_patch_operation_log()
+        self._set_apply_patch_status("No patch checked.")
+
+    def _begin_apply_patch_operation_log(self, operation: str) -> None:
+        self._reset_apply_patch_operation_log()
+        self._append_apply_patch_log(f"Apply Patch operation: {operation}")
+        self._append_apply_patch_log(f"Profile: {self.profile_name.get().strip() or 'Default'}")
+
+    def _append_apply_patch_log(self, msg: str) -> None:
+        if not hasattr(self, "_apply_patch_log_lines"):
+            self._apply_patch_log_lines = []
+        self._apply_patch_log_lines.append(str(msg))
+        self._log(msg)
+
+    def _copy_current_apply_patch_log_to_clipboard(self) -> None:
+        current_key = self._current_apply_patch_log_key()
+        if getattr(self, "_apply_patch_log_key", "") != current_key:
+            self._reset_apply_patch_operation_log()
+
+        lines = list(getattr(self, "_apply_patch_log_lines", []) or [])
+        patch_value = normalize_ui_path(self.patch_file.get().strip())
+        target_value = normalize_ui_path(self.patch_target_dir.get().strip())
+        header = [
+            "DumpIt Apply Patch log",
+            f"copied_at: {datetime.now().isoformat(timespec='seconds')}",
+            f"profile: {self.profile_name.get().strip() or 'Default'}",
+            f"patch: {patch_value or '—'}",
+            f"target: {target_value or '—'}",
+            f"strip: -p{self.patch_strip_level.get().strip() or '0'}",
+            f"reverse: {bool(self.patch_reverse.get())}",
+            f"auto_detect: {bool(self.patch_auto_detect.get())}",
+            "",
+        ]
+        if lines:
+            text = "\n".join(header + lines)
+        else:
+            text = "\n".join(header + ["No Apply Patch operation has been run for the currently selected patch."])
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._log("Apply Patch log copied to clipboard.")
 
     # ---------- Project / Output ----------
     def _browse_project(self) -> None:
@@ -3881,8 +3956,7 @@ class DumpItApp(tk.Tk):
         ttk.Button(actions, text="Preview changes", command=self._preview_patch_changes).pack(side="left", padx=4)
         ttk.Button(actions, text="Dry run", command=lambda: self._apply_patch_to_target(dry_run=True)).pack(side="left", padx=4)
         ttk.Button(actions, text="Apply", command=lambda: self._apply_patch_to_target(dry_run=False)).pack(side="left", padx=4)
-        ttk.Button(actions, text="Copy log", command=self._copy_full_log_to_clipboard).pack(side="left", padx=12)
-        self._apply_patch_status_text = "No patch checked."
+        ttk.Button(actions, text="Copy patch log", command=self._copy_current_apply_patch_log_to_clipboard).pack(side="left", padx=12)
 
         self._refresh_apply_patch_target()
 
@@ -4040,16 +4114,17 @@ class DumpItApp(tk.Tk):
 
     def _preview_patch_changes(self) -> None:
         self._refresh_apply_patch_target()
+        self._begin_apply_patch_operation_log("preview")
         try:
             patch_path, effective_root, effective_strip, attempts = self._resolve_patch_apply_plan_for_current_ui()
             reverse = self.patch_reverse.get()
 
-            self._log(
+            self._append_apply_patch_log(
                 f"Patch preview started: {patch_path} -> target={effective_root}, "
                 f"-p{effective_strip}, reverse={reverse}"
             )
             for attempt in attempts:
-                self._log(f"[Apply Patch Preview]   {attempt}")
+                self._append_apply_patch_log(f"[Apply Patch Preview]   {attempt}")
 
             diff = build_patch_preview_diff(
                 root=effective_root,
@@ -4066,20 +4141,25 @@ class DumpItApp(tk.Tk):
                 f"HTML: {out_path}"
             )
             self._set_apply_patch_status(status)
-            self._log(status)
+            self._append_apply_patch_log(status)
         except Exception as e:
             status = f"Patch preview failed. ERROR: {e}"
             self._set_apply_patch_status(status)
-            self._log(status)
+            self._append_apply_patch_log(status)
             messagebox.showerror("Patch Preview", status)
 
     def _apply_patch_to_target(self, dry_run: bool) -> None:
         self._refresh_apply_patch_target()
+        action = "dry-run" if dry_run else "apply"
+        self._begin_apply_patch_operation_log(action)
         try:
             patch_path, strip_level = self._get_patch_path_and_strip_level()
             target = self._get_patch_target_dir()
         except Exception as e:
-            messagebox.showerror("Apply Patch", str(e))
+            status = f"Patch {action} failed. ERROR: {e}"
+            self._set_apply_patch_status(status)
+            self._append_apply_patch_log(status)
+            messagebox.showerror("Apply Patch", status)
             return
 
         if not dry_run:
@@ -4087,14 +4167,14 @@ class DumpItApp(tk.Tk):
                 "Apply Patch",
                 f"Apply patch to this target folder?\n\nTarget: {target}\n\nPatch: {patch_path}",
             ):
+                self._append_apply_patch_log("Patch apply cancelled by user.")
                 return
 
-        action = "dry-run" if dry_run else "apply"
         reverse = self.patch_reverse.get()
         auto_detect = self.patch_auto_detect.get()
         summaries: list[str] = []
 
-        self._log(
+        self._append_apply_patch_log(
             f"Patch {action} started: {patch_path} -> target={target}, "
             f"preferred -p{strip_level}, reverse={reverse}, auto_detect={auto_detect}"
         )
@@ -4109,9 +4189,9 @@ class DumpItApp(tk.Tk):
                 )
                 effective_root = plan.root
                 effective_strip = plan.strip_level
-                self._log(f"[Apply Patch] Plan: cwd={effective_root}, -p{effective_strip}")
+                self._append_apply_patch_log(f"[Apply Patch] Plan: cwd={effective_root}, -p{effective_strip}")
                 for attempt in plan.attempts:
-                    self._log(f"[Apply Patch]   {attempt}")
+                    self._append_apply_patch_log(f"[Apply Patch]   {attempt}")
             else:
                 effective_root = target
                 effective_strip = strip_level
@@ -4146,12 +4226,12 @@ class DumpItApp(tk.Tk):
 
             status = f"Patch {action} completed. OK. cwd={effective_root}, -p{effective_strip}{backup_text}"
             self._set_apply_patch_status(status)
-            self._log(status)
+            self._append_apply_patch_log(status)
             messagebox.showinfo("Apply Patch", status)
         except Exception as e:
             status = f"Patch {action} failed. ERROR: {e}"
             self._set_apply_patch_status(status)
-            self._log(status)
+            self._append_apply_patch_log(status)
             messagebox.showerror("Apply Patch", status)
 
 
