@@ -2214,6 +2214,22 @@ def _format_quota_rank_label(rank: int) -> str:
     return f"Q{int(rank)}"
 
 
+def _format_quota_label_for_family(rank: int, source_quota: QuotaRef | None) -> str:
+    """Format a required quota rank using the source domain letter.
+
+    QRAR compares ranks only, but LAQR must not erase the declared domain.
+    If A2 is too high and the minimum rank is 0, the required label is A0,
+    not Q0.
+    """
+    value = int(rank)
+    family = str(getattr(source_quota, "family", "") or "Q").upper()
+    if family == "L" and value < 0:
+        return f"Lm{abs(value)}"
+    if family and family != "Q":
+        return f"{family}{value}"
+    return _format_quota_rank_label(value)
+
+
 def _build_lowest_available_quota_violations(
     units: list[QuotaSourceUnit],
     direct_dependencies: list[QuotaDependency],
@@ -2221,13 +2237,15 @@ def _build_lowest_available_quota_violations(
     """Enforce the Lowest Available Quota Rule.
 
     A module must live in the lowest quota allowed by its resolved internal
-    project imports. If it imports no internal quota, it belongs to Q0. If its
-    highest imported quota is Qn, it belongs to Q(n+1). QRAR still reports
-    non-adjacent, same-rank, and upward edges; this pass reports files placed
-    above the minimum required rank.
+    project imports. If it imports no internal quota, it belongs to rank 0 in
+    its own domain letter. If its highest imported quota is Qn, it belongs to
+    rank n+1 in its own domain letter. QRAR still reports non-adjacent,
+    same-rank, and upward edges; this pass reports files placed above the
+    minimum required rank.
     """
     units_by_path = {unit.rel_path: unit for unit in units}
     imported_ranks_by_source: dict[str, set[int]] = {}
+    imported_labels_by_source: dict[str, set[str]] = {}
     for dep in direct_dependencies:
         if not dep.source_path or not dep.target_path:
             continue
@@ -2237,6 +2255,7 @@ def _build_lowest_available_quota_violations(
         if target_unit is None or target_unit.quota is None:
             continue
         imported_ranks_by_source.setdefault(dep.source_path, set()).add(_quota_rank_number(target_unit.quota))
+        imported_labels_by_source.setdefault(dep.source_path, set()).add(target_unit.quota.label)
 
     out: list[QuotaDependency] = []
     for unit in sorted(units, key=lambda item: item.rel_path.lower()):
@@ -2244,20 +2263,25 @@ def _build_lowest_available_quota_violations(
             continue
         source_rank = _quota_rank_number(unit.quota)
         imported_ranks = sorted(imported_ranks_by_source.get(unit.rel_path, set()))
+        imported_labels = sorted(imported_labels_by_source.get(unit.rel_path, set()), key=str.lower)
         expected_rank = (max(imported_ranks) + 1) if imported_ranks else 0
         if source_rank <= expected_rank:
             continue
 
-        expected_label = _format_quota_rank_label(expected_rank)
+        expected_label = _format_quota_label_for_family(expected_rank, unit.quota)
         if imported_ranks:
-            imports_text = ", ".join(_format_quota_rank_label(rank) for rank in imported_ranks)
+            rank_text = ", ".join(_format_quota_rank_label(rank) for rank in imported_ranks)
+            imports_text = ", ".join(imported_labels) if imported_labels else rank_text
             reason = (
-                f"Highest resolved internal imported quota is {_format_quota_rank_label(max(imported_ranks))}; "
-                f"lowest available source quota is {expected_label}."
+                f"Highest resolved internal imported rank is {_format_quota_rank_label(max(imported_ranks))}; "
+                f"lowest available source quota in domain {unit.quota.family} is {expected_label}."
             )
             target_spec = f"internal imports: {imports_text}"
         else:
-            reason = "No resolved internal project quota imports; lowest available source quota is Q0."
+            reason = (
+                "No resolved internal project quota imports; "
+                f"lowest available source quota in domain {unit.quota.family} is {expected_label}."
+            )
             target_spec = "no resolved internal quota imports"
 
         out.append(
@@ -2274,7 +2298,7 @@ def _build_lowest_available_quota_violations(
                 severity="violation",
                 message=(
                     "Lowest Available Quota Rule broken: "
-                    f"source is Q{source_rank}, but it must occupy {expected_label}. {reason}"
+                    f"source is {unit.quota.label} (rank Q{source_rank}), but it must occupy {expected_label}. {reason}"
                 ),
             )
         )
