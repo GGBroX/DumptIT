@@ -2123,9 +2123,9 @@ def _known_quota_refs(units: list[QuotaSourceUnit]) -> tuple[QuotaRef, ...]:
 
 
 def _quota_rank_number(quota: QuotaRef) -> int:
-    """Return the Quota Rank Adjacency Rule rank.
+    """Return the numeric Quota Rank Adjacency Rule rank.
 
-    QRAR deliberately ignores the family letter. A3, S3 and U3 all belong to Q3.
+    QRAR deliberately ignores the family letter. A3, S3 and U3 all have rank 3.
     Subquote suffixes remain useful as labels, but the rank used by QRAR is the
     numeric quota prefix.
     """
@@ -2163,27 +2163,27 @@ def _dependency_status(
         return (
             "upward_import",
             "violation",
-            f"Quota Rank Adjacency Rule broken: source Q{source_rank} may import only Q{expected_rank}; target is Q{target_rank}.",
+            f"Quota Rank Adjacency Rule broken: {source.quota.label} has rank {source_rank} and may import only rank {expected_rank}; target {target.quota.label} has rank {target_rank}.",
         )
     if target_rank == source_rank:
         if target.quota.label == source.quota.label:
             return (
                 "same_quota_import",
                 "violation",
-                f"Quota Rank Adjacency Rule broken: source Q{source_rank} imports another member of the same quota; expected Q{expected_rank}.",
+                f"Quota Rank Adjacency Rule broken: {source.quota.label} imports another member of the same quota; expected rank {expected_rank}.",
             )
         return (
             "same_depth_import",
             "violation",
-            f"Quota Rank Adjacency Rule broken: source Q{source_rank} imports another quota at the same rank; expected Q{expected_rank}.",
+            f"Quota Rank Adjacency Rule broken: {source.quota.label} imports another quota at the same rank {source_rank}; expected rank {expected_rank}.",
         )
     if not _is_quota_rank_adjacent_dependency(source.quota, target.quota):
         return (
             "quota_rank_adjacency_violation",
             "violation",
-            f"Quota Rank Adjacency Rule broken: source Q{source_rank} may import only Q{expected_rank}; target is Q{target_rank}.",
+            f"Quota Rank Adjacency Rule broken: {source.quota.label} has rank {source_rank} and may import only rank {expected_rank}; target {target.quota.label} has rank {target_rank}.",
         )
-    return "ok", "ok", f"Adjacent quota-rank dependency: Q{source_rank} -> Q{target_rank}."
+    return "ok", "ok", f"Adjacent quota-rank dependency: {source.quota.label} rank {source_rank} -> {target.quota.label} rank {target_rank}."
 
 
 def _make_dependency(
@@ -2211,15 +2211,18 @@ def _make_dependency(
 
 
 def _format_quota_rank_label(rank: int) -> str:
-    return f"Q{int(rank)}"
+    return str(int(rank))
+
+
+def _format_quota_rank_phrase(rank: int) -> str:
+    return f"rank {int(rank)}"
 
 
 def _format_quota_label_for_family(rank: int, source_quota: QuotaRef | None) -> str:
     """Format a required quota rank using the source domain letter.
 
     QRAR compares ranks only, but LAQR must not erase the declared domain.
-    If A2 is too high and the minimum rank is 0, the required label is A0,
-    not Q0.
+    If A2 is too high and the minimum rank is 0, the required label is A0.
     """
     value = int(rank)
     family = str(getattr(source_quota, "family", "") or "Q").upper()
@@ -2227,7 +2230,7 @@ def _format_quota_label_for_family(rank: int, source_quota: QuotaRef | None) -> 
         return f"Lm{abs(value)}"
     if family and family != "Q":
         return f"{family}{value}"
-    return _format_quota_rank_label(value)
+    return _format_quota_rank_phrase(value)
 
 
 def _build_lowest_available_quota_violations(
@@ -2238,7 +2241,7 @@ def _build_lowest_available_quota_violations(
 
     A module must live in the lowest quota allowed by its resolved internal
     project imports. If it imports no internal quota, it belongs to rank 0 in
-    its own domain letter. If its highest imported quota is Qn, it belongs to
+    its own domain letter. If its highest imported quota has rank n, it belongs to
     rank n+1 in its own domain letter. QRAR still reports non-adjacent,
     same-rank, and upward edges; this pass reports files placed above the
     minimum required rank.
@@ -2273,7 +2276,7 @@ def _build_lowest_available_quota_violations(
             rank_text = ", ".join(_format_quota_rank_label(rank) for rank in imported_ranks)
             imports_text = ", ".join(imported_labels) if imported_labels else rank_text
             reason = (
-                f"Highest resolved internal imported rank is {_format_quota_rank_label(max(imported_ranks))}; "
+                f"Highest resolved internal imported rank is {max(imported_ranks)}; "
                 f"lowest available source quota in domain {unit.quota.family} is {expected_label}."
             )
             target_spec = f"internal imports: {imports_text}"
@@ -2298,7 +2301,7 @@ def _build_lowest_available_quota_violations(
                 severity="violation",
                 message=(
                     "Lowest Available Quota Rule broken: "
-                    f"source is {unit.quota.label} (rank Q{source_rank}), but it must occupy {expected_label}. {reason}"
+                    f"source is {unit.quota.label} (rank {source_rank}), but it must occupy {expected_label}. {reason}"
                 ),
             )
         )
@@ -2335,7 +2338,7 @@ def _build_quota_indirect_dependencies(
     Direct imports catch the immediate broken edge. This pass reports upstream
     files that reach a broken edge through at least one resolved import, so a
     source is flagged when it logically depends on a forbidden dependency chain.
-    Fully adjacent chains such as Q4 -> Q3 -> Q2 are not reported, and normal
+    Fully adjacent chains such as rank 4 -> rank 3 -> rank 2 are not reported, and normal
     downstream edges after an already reported break are not duplicated.
     """
     adjacency: dict[str, list[QuotaDependency]] = {}
