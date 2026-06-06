@@ -2208,6 +2208,79 @@ def _make_dependency(
     )
 
 
+
+
+def _format_quota_rank_label(rank: int) -> str:
+    return f"Q{int(rank)}"
+
+
+def _build_lowest_available_quota_violations(
+    units: list[QuotaSourceUnit],
+    direct_dependencies: list[QuotaDependency],
+) -> tuple[QuotaDependency, ...]:
+    """Enforce the Lowest Available Quota Rule.
+
+    A module must live in the lowest quota allowed by its resolved internal
+    project imports. If it imports no internal quota, it belongs to Q0. If its
+    highest imported quota is Qn, it belongs to Q(n+1). QRAR still reports
+    non-adjacent, same-rank, and upward edges; this pass reports files placed
+    above the minimum required rank.
+    """
+    units_by_path = {unit.rel_path: unit for unit in units}
+    imported_ranks_by_source: dict[str, set[int]] = {}
+    for dep in direct_dependencies:
+        if not dep.source_path or not dep.target_path:
+            continue
+        if dep.status in {"self", "external", "unresolved", "unknown_quota"}:
+            continue
+        target_unit = units_by_path.get(dep.target_path)
+        if target_unit is None or target_unit.quota is None:
+            continue
+        imported_ranks_by_source.setdefault(dep.source_path, set()).add(_quota_rank_number(target_unit.quota))
+
+    out: list[QuotaDependency] = []
+    for unit in sorted(units, key=lambda item: item.rel_path.lower()):
+        if unit.quota is None:
+            continue
+        source_rank = _quota_rank_number(unit.quota)
+        imported_ranks = sorted(imported_ranks_by_source.get(unit.rel_path, set()))
+        expected_rank = (max(imported_ranks) + 1) if imported_ranks else 0
+        if source_rank <= expected_rank:
+            continue
+
+        expected_label = _format_quota_rank_label(expected_rank)
+        if imported_ranks:
+            imports_text = ", ".join(_format_quota_rank_label(rank) for rank in imported_ranks)
+            reason = (
+                f"Highest resolved internal imported quota is {_format_quota_rank_label(max(imported_ranks))}; "
+                f"lowest available source quota is {expected_label}."
+            )
+            target_spec = f"internal imports: {imports_text}"
+        else:
+            reason = "No resolved internal project quota imports; lowest available source quota is Q0."
+            target_spec = "no resolved internal quota imports"
+
+        out.append(
+            QuotaDependency(
+                source_path=unit.rel_path,
+                source_quota=unit.quota.label,
+                target_spec=target_spec,
+                target_path="",
+                target_quota=expected_label,
+                language=unit.language,
+                line=0,
+                kind="lowest-available-quota",
+                status="lowest_available_quota_violation",
+                severity="violation",
+                message=(
+                    "Lowest Available Quota Rule broken: "
+                    f"source is Q{source_rank}, but it must occupy {expected_label}. {reason}"
+                ),
+            )
+        )
+    return tuple(out)
+
+
 def _is_quota_rank_rule_break(dep: QuotaDependency) -> bool:
     return dep.severity == "violation" and dep.status in {
         "upward_import",
@@ -2368,6 +2441,9 @@ def inspect_quota_dependencies(
                     continue
                 add_dependency(_make_dependency(unit, target, raw, known_quotas))
 
+    for laqr_dep in _build_lowest_available_quota_violations(units, dependencies):
+        add_dependency(laqr_dep)
+
     for indirect_dep in _build_quota_indirect_dependencies(dependencies):
         add_dependency(indirect_dep)
 
@@ -2391,6 +2467,7 @@ def _quota_status_label(status: str) -> str:
         "quota_adjacency_violation": "ADJACENCY",
         "quota_rank_adjacency_violation": "QRAR",
         "quota_rank_indirect_violation": "INDIRECT QRAR",
+        "lowest_available_quota_violation": "LAQR",
         "unknown_quota": "UNKNOWN QUOTA",
         "unresolved": "UNRESOLVED",
         "ok": "OK",
@@ -2503,7 +2580,7 @@ main {{ padding: 18px 42px 18px 18px; overflow: hidden; }}
 .diff-map {{ position: fixed; right: 12px; top: 96px; bottom: 16px; width: 20px; z-index: 20; border: 1px solid var(--border); border-radius: 999px; background: rgba(17,24,39,.88); box-shadow: 0 10px 35px rgba(0,0,0,.35); overflow: hidden; }}
 .diff-map-marker {{ position: absolute; left: 3px; right: 3px; min-height: 5px; border-radius: 999px; cursor: pointer; opacity: .95; border: 1px solid rgba(0,0,0,.35); }}
 .diff-map-marker:hover {{ left: 1px; right: 1px; opacity: 1; }}
-.diff-map-marker.upward_import, .diff-map-marker.same_quota_import, .diff-map-marker.same_depth_import, .diff-map-marker.quota_adjacency_violation, .diff-map-marker.quota_rank_adjacency_violation, .diff-map-marker.quota_rank_indirect_violation {{ background: var(--bad); }}
+.diff-map-marker.upward_import, .diff-map-marker.same_quota_import, .diff-map-marker.same_depth_import, .diff-map-marker.quota_adjacency_violation, .diff-map-marker.quota_rank_adjacency_violation, .diff-map-marker.quota_rank_indirect_violation, .diff-map-marker.lowest_available_quota_violation {{ background: var(--bad); }}
 .diff-map-marker.unknown_quota, .diff-map-marker.unresolved {{ background: var(--warn); }}
 .diff-map-marker.active {{ outline: 2px solid #ffffff; outline-offset: 1px; }}
 .file-block {{ margin: 0 0 18px; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; background: var(--panel); box-shadow: 0 12px 40px rgba(0,0,0,.25); }}
@@ -4042,7 +4119,7 @@ class DumpItApp(tk.Tk):
             text=(
                 "Static dependency check for Quota Development. "
                 "Python and JavaScript imports are resolved against included project files. "
-                "Violations: same-rank import, upward import, Quota Rank Adjacency Rule break, indirect logical QRAR break. "
+                "Violations: same-rank import, upward import, Quota Rank Adjacency Rule break, indirect logical QRAR break, Lowest Available Quota Rule break. "
                 "Report output is HTML, same style as Diff."
             ),
             wraplength=820,
@@ -4147,7 +4224,7 @@ class DumpItApp(tk.Tk):
             f"Checked {result.checked_files} operational files: Python {result.python_files}, JS {result.js_files}. "
             f"Quota files {result.quota_files}, unknown quota files {len(result.unknown_quota_files)}. "
             f"Violations {len(result.violations)}, warnings {len(result.warnings)}. "
-            "Export include/exclude settings are used; test files are ignored as violation sources; Quota Rank Adjacency Rule and indirect logical dependency checks are enforced."
+            "Export include/exclude settings are used; test files are ignored as violation sources; QRAR, indirect logical dependency checks, and Lowest Available Quota Rule are enforced."
         )
         self.lbl_quota_status.configure(text=status)
         self._log(f"Quota Inspector: {status}")
