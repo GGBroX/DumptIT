@@ -2239,12 +2239,12 @@ def _build_lowest_available_quota_violations(
 ) -> tuple[QuotaDependency, ...]:
     """Enforce the Lowest Available Quota Rule.
 
-    A module must live in the lowest quota allowed by its resolved internal
-    project imports. If it imports no internal quota, it belongs to rank 0 in
-    its own domain letter. If its highest imported quota has rank n, it belongs to
-    rank n+1 in its own domain letter. QRAR still reports non-adjacent,
-    same-rank, and upward edges; this pass reports files placed above the
-    minimum required rank.
+    A module must live in the exact lowest quota allowed by its resolved
+    internal project imports. If it imports no internal quota, it belongs to
+    rank 0 in its own domain letter. If its highest imported quota has rank n,
+    it belongs to rank n+1 in its own domain letter. QRAR still reports
+    non-adjacent, same-rank, and upward edges; this pass reports any file whose
+    source rank differs from the computed lowest available rank.
     """
     units_by_path = {unit.rel_path: unit for unit in units}
     imported_ranks_by_source: dict[str, set[int]] = {}
@@ -2273,22 +2273,26 @@ def _build_lowest_available_quota_violations(
         imported_ranks = sorted(imported_ranks_by_source.get(unit.rel_path, set()))
         imported_labels = sorted(imported_labels_by_source.get(unit.rel_path, set()), key=str.lower)
         expected_rank = (max(imported_ranks) + 1) if imported_ranks else 0
-        if source_rank <= expected_rank:
+        if source_rank == expected_rank:
             continue
 
         expected_label = _format_quota_label_for_family(expected_rank, unit.quota)
         if imported_ranks:
             rank_text = ", ".join(_format_quota_rank_label(rank) for rank in imported_ranks)
             imports_text = ", ".join(imported_labels) if imported_labels else rank_text
+            placement = "too high" if source_rank > expected_rank else "too low"
             reason = (
                 f"Highest resolved internal imported rank is {max(imported_ranks)}; "
-                f"lowest available source quota in domain {unit.quota.family} is {expected_label}."
+                f"lowest available source quota in domain {unit.quota.family} is {expected_label}. "
+                f"Current source quota is {placement}."
             )
             target_spec = f"internal imports: {imports_text}"
         else:
+            placement = "too high" if source_rank > expected_rank else "too low"
             reason = (
                 "No resolved internal project quota imports; "
-                f"lowest available source quota in domain {unit.quota.family} is {expected_label}."
+                f"lowest available source quota in domain {unit.quota.family} is {expected_label}. "
+                f"Current source quota is {placement}."
             )
             target_spec = "no resolved internal quota imports"
 
