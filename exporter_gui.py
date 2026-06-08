@@ -1673,15 +1673,16 @@ body {{ margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 sy
 header {{ position: sticky; top: 0; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 22px; background: rgba(11,16,32,.92); border-bottom: 1px solid var(--border); backdrop-filter: blur(10px); }}
 h1 {{ margin: 0; font-size: 18px; font-weight: 700; }}
 .meta {{ color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60vw; }}
-.header-right {{ display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }}
+.header-right {{ display: flex; align-items: stretch; justify-content: flex-end; gap: 12px; flex-wrap: wrap; }}
 .summary {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }}
 .card {{ padding: 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); min-width: 86px; text-align: center; }}
 .card b {{ display: block; font-size: 18px; }}
-.change-controls {{ display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }}
-.change-btn {{ border: 1px solid var(--border); border-radius: 9px; padding: 7px 10px; background: var(--panel); color: var(--text); font: 12px/1.2 system-ui, -apple-system, Segoe UI, sans-serif; cursor: pointer; }}
+.change-controls {{ display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: nowrap; }}
+.change-stack {{ display: flex; flex-direction: column; gap: 6px; align-items: stretch; }}
+.change-btn {{ min-width: 136px; border: 1px solid var(--border); border-radius: 9px; padding: 7px 10px; background: var(--panel); color: var(--text); font: 12px/1.2 system-ui, -apple-system, Segoe UI, sans-serif; cursor: pointer; text-align: center; }}
 .change-btn:hover:not(:disabled) {{ background: var(--panel-2); border-color: #3b82f6; }}
 .change-btn:disabled {{ opacity: .45; cursor: default; }}
-.change-counter {{ min-width: 62px; color: var(--muted); font-size: 12px; text-align: right; }}
+.change-counter {{ min-width: 62px; color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; align-self: center; }}
 .layout {{ display: grid; grid-template-columns: 320px minmax(0, 1fr); min-height: calc(100vh - 82px); }}
 aside {{ position: sticky; top: 82px; align-self: start; height: calc(100vh - 82px); overflow: auto; padding: 14px; border-right: 1px solid var(--border); background: var(--panel); }}
 .search {{ width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: #0b1020; color: var(--text); outline: none; margin-bottom: 12px; }}
@@ -1720,7 +1721,7 @@ tr.del .ln {{ background: var(--del-bg); }}
 tr.chg .ln {{ background: var(--chg-bg); }}
 tr.active-change td {{ box-shadow: inset 0 0 0 2px rgba(255,255,255,.92); }}
 .empty {{ padding: 40px; border: 1px solid var(--border); border-radius: 16px; background: var(--panel); color: var(--muted); }}
-@media (max-width: 900px) {{ .layout {{ grid-template-columns: 1fr; }} aside {{ position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--border); }} main {{ padding-right: 18px; }} .diff-map {{ display: none; }} header {{ align-items: flex-start; flex-direction: column; }} .header-right {{ align-items: flex-start; width: 100%; }} .summary {{ justify-content: flex-start; }} .change-controls {{ justify-content: flex-start; }} .meta {{ max-width: 100%; }} }}
+@media (max-width: 900px) {{ .layout {{ grid-template-columns: 1fr; }} aside {{ position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--border); }} main {{ padding-right: 18px; }} .diff-map {{ display: none; }} header {{ align-items: flex-start; flex-direction: column; }} .header-right {{ align-items: flex-start; width: 100%; gap: 10px; }} .summary {{ justify-content: flex-start; }} .change-controls {{ justify-content: flex-start; flex-wrap: wrap; }} .change-counter {{ min-width: 0; text-align: left; }} .meta {{ max-width: 100%; }} }}
 </style>
 </head>
 <body>
@@ -1737,8 +1738,10 @@ tr.active-change td {{ box-shadow: inset 0 0 0 2px rgba(255,255,255,.92); }}
       <div class="card"><b>{len(diff.unchanged)}</b>unchanged</div>
     </div>
     <div class="change-controls" aria-label="Change navigation">
-      <button id="prev-change" class="change-btn" type="button">Previous change</button>
-      <button id="next-change" class="change-btn" type="button">Next change</button>
+      <div class="change-stack">
+        <button id="prev-change" class="change-btn" type="button">↑ Previous change</button>
+        <button id="next-change" class="change-btn" type="button">↓ Next change</button>
+      </div>
       <span id="change-counter" class="change-counter">0 / 0</span>
     </div>
   </div>
