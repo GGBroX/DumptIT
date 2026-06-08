@@ -1673,9 +1673,15 @@ body {{ margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 sy
 header {{ position: sticky; top: 0; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 22px; background: rgba(11,16,32,.92); border-bottom: 1px solid var(--border); backdrop-filter: blur(10px); }}
 h1 {{ margin: 0; font-size: 18px; font-weight: 700; }}
 .meta {{ color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60vw; }}
-.summary {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.header-right {{ display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }}
+.summary {{ display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }}
 .card {{ padding: 7px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); min-width: 86px; text-align: center; }}
 .card b {{ display: block; font-size: 18px; }}
+.change-controls {{ display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }}
+.change-btn {{ border: 1px solid var(--border); border-radius: 9px; padding: 7px 10px; background: var(--panel); color: var(--text); font: 12px/1.2 system-ui, -apple-system, Segoe UI, sans-serif; cursor: pointer; }}
+.change-btn:hover:not(:disabled) {{ background: var(--panel-2); border-color: #3b82f6; }}
+.change-btn:disabled {{ opacity: .45; cursor: default; }}
+.change-counter {{ min-width: 62px; color: var(--muted); font-size: 12px; text-align: right; }}
 .layout {{ display: grid; grid-template-columns: 320px minmax(0, 1fr); min-height: calc(100vh - 82px); }}
 aside {{ position: sticky; top: 82px; align-self: start; height: calc(100vh - 82px); overflow: auto; padding: 14px; border-right: 1px solid var(--border); background: var(--panel); }}
 .search {{ width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: #0b1020; color: var(--text); outline: none; margin-bottom: 12px; }}
@@ -1712,8 +1718,9 @@ tr.ins .ln, tr.del .ln, tr.chg .ln {{ color: #111827; font-weight: 800; }}
 tr.ins .ln {{ background: var(--add-bg); }}
 tr.del .ln {{ background: var(--del-bg); }}
 tr.chg .ln {{ background: var(--chg-bg); }}
+tr.active-change td {{ box-shadow: inset 0 0 0 2px rgba(255,255,255,.92); }}
 .empty {{ padding: 40px; border: 1px solid var(--border); border-radius: 16px; background: var(--panel); color: var(--muted); }}
-@media (max-width: 900px) {{ .layout {{ grid-template-columns: 1fr; }} aside {{ position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--border); }} main {{ padding-right: 18px; }} .diff-map {{ display: none; }} header {{ align-items: flex-start; flex-direction: column; }} .meta {{ max-width: 100%; }} }}
+@media (max-width: 900px) {{ .layout {{ grid-template-columns: 1fr; }} aside {{ position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--border); }} main {{ padding-right: 18px; }} .diff-map {{ display: none; }} header {{ align-items: flex-start; flex-direction: column; }} .header-right {{ align-items: flex-start; width: 100%; }} .summary {{ justify-content: flex-start; }} .change-controls {{ justify-content: flex-start; }} .meta {{ max-width: 100%; }} }}
 </style>
 </head>
 <body>
@@ -1722,11 +1729,18 @@ tr.chg .ln {{ background: var(--chg-bg); }}
     <h1>DumpIt Diff</h1>
     <div class="meta">Old: {_html_escape(str(diff.old.source))}<br>New: {_html_escape(str(diff.new.source))}</div>
   </div>
-  <div class="summary">
-    <div class="card"><b>{len(diff.added)}</b>added</div>
-    <div class="card"><b>{len(diff.removed)}</b>removed</div>
-    <div class="card"><b>{len(diff.modified)}</b>modified</div>
-    <div class="card"><b>{len(diff.unchanged)}</b>unchanged</div>
+  <div class="header-right">
+    <div class="summary">
+      <div class="card"><b>{len(diff.added)}</b>added</div>
+      <div class="card"><b>{len(diff.removed)}</b>removed</div>
+      <div class="card"><b>{len(diff.modified)}</b>modified</div>
+      <div class="card"><b>{len(diff.unchanged)}</b>unchanged</div>
+    </div>
+    <div class="change-controls" aria-label="Change navigation">
+      <button id="prev-change" class="change-btn" type="button">Previous change</button>
+      <button id="next-change" class="change-btn" type="button">Next change</button>
+      <span id="change-counter" class="change-counter">0 / 0</span>
+    </div>
   </div>
 </header>
 <div class="layout">
@@ -1740,6 +1754,11 @@ tr.chg .ln {{ background: var(--chg-bg); }}
 <script>
 const filter = document.getElementById('filter');
 const diffMap = document.getElementById('diff-map');
+const prevChangeButton = document.getElementById('prev-change');
+const nextChangeButton = document.getElementById('next-change');
+const changeCounter = document.getElementById('change-counter');
+let changeGroups = [];
+let activeChangeIndex = -1;
 
 function visibleFileBlocks() {{
   return Array.from(document.querySelectorAll('.file-block')).filter(el => el.style.display !== 'none');
@@ -1776,16 +1795,111 @@ function updateActiveDiffMarker() {{
   Array.from(diffMap.children).forEach((marker, i) => marker.classList.toggle('active', i === activeIndex));
 }}
 
+function rowDocumentTop(row) {{
+  return row.getBoundingClientRect().top + window.scrollY;
+}}
+
+function clearActiveChange() {{
+  document.querySelectorAll('tr.active-change').forEach(row => row.classList.remove('active-change'));
+}}
+
+function updateChangeNavState() {{
+  const count = changeGroups.length;
+  if (prevChangeButton) prevChangeButton.disabled = count === 0;
+  if (nextChangeButton) nextChangeButton.disabled = count === 0;
+  if (changeCounter) changeCounter.textContent = activeChangeIndex >= 0 ? `${{activeChangeIndex + 1}} / ${{count}}` : `0 / ${{count}}`;
+}}
+
+function buildChangeGroups() {{
+  clearActiveChange();
+  const rows = Array.from(document.querySelectorAll('tr.ins, tr.del, tr.chg')).filter(row => {{
+    const block = row.closest('.file-block');
+    return block && block.style.display !== 'none';
+  }});
+  const groups = [];
+  let current = [];
+  let lastRow = null;
+  let lastBlock = null;
+
+  rows.forEach(row => {{
+    const block = row.closest('.file-block');
+    const sameBlock = block === lastBlock;
+    const adjacent = lastRow && lastRow.nextElementSibling === row;
+    if (!sameBlock || !adjacent) {{
+      if (current.length) groups.push(current);
+      current = [];
+    }}
+    current.push(row);
+    lastRow = row;
+    lastBlock = block;
+  }});
+  if (current.length) groups.push(current);
+
+  changeGroups = groups;
+  activeChangeIndex = -1;
+  updateChangeNavState();
+}}
+
+function visibleChangeIndexFromViewport(direction) {{
+  if (!changeGroups.length) return -1;
+  const y = window.scrollY + 130;
+  if (direction > 0) {{
+    const nextIndex = changeGroups.findIndex(group => rowDocumentTop(group[0]) > y);
+    return nextIndex >= 0 ? nextIndex : 0;
+  }}
+  for (let i = changeGroups.length - 1; i >= 0; i--) {{
+    if (rowDocumentTop(changeGroups[i][0]) < y - 4) return i;
+  }}
+  return changeGroups.length - 1;
+}}
+
+function setActiveChange(index, scrollIntoView) {{
+  if (!changeGroups.length) return;
+  clearActiveChange();
+  activeChangeIndex = Math.max(0, Math.min(changeGroups.length - 1, index));
+  const group = changeGroups[activeChangeIndex];
+  group.forEach(row => row.classList.add('active-change'));
+  updateChangeNavState();
+  if (scrollIntoView) {{
+    group[0].scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+  }}
+}}
+
+function goToChange(direction) {{
+  if (!changeGroups.length) return;
+  const base = activeChangeIndex >= 0 ? activeChangeIndex : visibleChangeIndexFromViewport(direction);
+  const nextIndex = activeChangeIndex >= 0
+    ? (base + direction + changeGroups.length) % changeGroups.length
+    : base;
+  setActiveChange(nextIndex, true);
+}}
+
 filter.addEventListener('input', () => {{
   const q = filter.value.trim().toLowerCase();
   document.querySelectorAll('.nav-item, .file-block').forEach(el => {{
     const path = el.dataset.path || '';
     el.style.display = path.includes(q) ? '' : 'none';
   }});
+  buildChangeGroups();
   renderDiffMap();
 }});
 
-window.addEventListener('load', renderDiffMap);
+if (prevChangeButton) prevChangeButton.addEventListener('click', () => goToChange(-1));
+if (nextChangeButton) nextChangeButton.addEventListener('click', () => goToChange(1));
+document.addEventListener('keydown', event => {{
+  const target = event.target;
+  const editing = target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(String(target.tagName || '').toUpperCase());
+  if (editing) return;
+  if (event.key === 'n' || event.key === 'N') {{
+    event.preventDefault();
+    goToChange(1);
+  }} else if (event.key === 'p' || event.key === 'P') {{
+    event.preventDefault();
+    goToChange(-1);
+  }}
+}});
+
+window.addEventListener('load', () => {{ buildChangeGroups(); renderDiffMap(); }});
 window.addEventListener('resize', renderDiffMap);
 window.addEventListener('scroll', updateActiveDiffMarker, {{ passive: true }});
 </script>
