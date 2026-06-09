@@ -268,8 +268,16 @@ def collect_unified_patch_target_paths(patch_path: Path, strip_level: int) -> se
     return touched
 
 
-def create_patch_backup(root: Path, patch_path: Path, strip_level: int) -> tuple[Path | None, int]:
-    touched = collect_unified_patch_target_paths(patch_path, strip_level)
+def create_patch_backup(
+    root: Path,
+    patch_path: Path,
+    strip_level: int,
+    patch_directory: str | None = None,
+) -> tuple[Path | None, int]:
+    touched = {
+        _prepend_patch_directory(rel, patch_directory)
+        for rel in collect_unified_patch_target_paths(patch_path, strip_level)
+    }
     existing = []
     for rel in sorted(touched, key=str.lower):
         src = root / Path(*rel.split("/"))
@@ -294,7 +302,30 @@ def _patch_rel_path(root: Path, rel_posix: str) -> Path:
     return root / Path(*rel_posix.split("/"))
 
 
-def _collect_patch_preview_rel_paths(patch_path: Path, strip_level: int) -> tuple[str, ...]:
+def _normalize_patch_directory(patch_directory: str | None) -> str | None:
+    if not patch_directory:
+        return None
+    normalized = patch_directory.replace("\\", "/").strip().strip("/")
+    if not normalized or normalized == ".":
+        return None
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _prepend_patch_directory(rel_posix: str, patch_directory: str | None) -> str:
+    patch_directory = _normalize_patch_directory(patch_directory)
+    if not patch_directory:
+        return rel_posix
+    return f"{patch_directory}/{rel_posix}"
+
+
+def _collect_patch_preview_rel_paths(
+    patch_path: Path,
+    strip_level: int,
+    patch_directory: str | None = None,
+) -> tuple[str, ...]:
     """Return all relative paths needed to preview a patch application.
 
     Both old and new side paths are included so rename/delete/create hunks can be
@@ -312,7 +343,7 @@ def _collect_patch_preview_rel_paths(patch_path: Path, strip_level: int) -> tupl
             for raw in (old_path, new_path):
                 rel = _strip_patch_path(raw or "", strip_level)
                 if rel:
-                    paths.add(rel)
+                    paths.add(_prepend_patch_directory(rel, patch_directory))
             old_path = None
 
     # Fallback for unusual patches that expose only diff --git headers or mode changes.
@@ -320,7 +351,7 @@ def _collect_patch_preview_rel_paths(patch_path: Path, strip_level: int) -> tupl
         for raw in collect_patch_raw_paths(patch_path):
             rel = _strip_patch_path(raw, strip_level)
             if rel:
-                paths.add(rel)
+                paths.add(_prepend_patch_directory(rel, patch_directory))
 
     return tuple(sorted(paths, key=str.lower))
 
@@ -372,9 +403,10 @@ def build_patch_preview_diff(
     patch_path: Path,
     strip_level: int,
     reverse: bool,
+    patch_directory: str | None = None,
 ) -> DumpDiffResult:
     """Build a before/after visual diff for a patch without touching the target root."""
-    rel_paths = _collect_patch_preview_rel_paths(patch_path, strip_level)
+    rel_paths = _collect_patch_preview_rel_paths(patch_path, strip_level, patch_directory)
     if not rel_paths:
         raise ValueError("No file paths were found in this patch.")
 
@@ -390,6 +422,7 @@ def build_patch_preview_diff(
             strip_level=strip_level,
             reverse=reverse,
             check_only=False,
+            patch_directory=patch_directory,
         )
         if not ok:
             raise RuntimeError(output)
@@ -407,6 +440,10 @@ def build_patch_preview_diff(
     return compare_dump_snapshots(before, after)
 
 
+def _git_apply_output_has_skipped_patch(output: str) -> bool:
+    return bool(re.search(r"(?im)^\s*Skipped patch ['\"]?.+", output or ""))
+
+
 def run_git_apply_patch(
     *,
     root: Path,
@@ -414,6 +451,7 @@ def run_git_apply_patch(
     strip_level: int,
     reverse: bool,
     check_only: bool,
+    patch_directory: str | None = None,
 ) -> tuple[bool, str]:
     git = shutil.which("git")
     if not git:
@@ -424,6 +462,9 @@ def run_git_apply_patch(
         cmd.append("--check")
     if reverse:
         cmd.append("-R")
+    patch_directory = _normalize_patch_directory(patch_directory)
+    if patch_directory:
+        cmd.append(f"--directory={patch_directory}")
     cmd.append(f"-p{strip_level}")
     cmd.append(str(patch_path))
 
@@ -437,6 +478,12 @@ def run_git_apply_patch(
         creationflags=creationflags,
     )
     output = "\n".join(x for x in [proc.stdout.strip(), proc.stderr.strip()] if x)
+    if _git_apply_output_has_skipped_patch(output):
+        return False, (
+            "git apply skipped one or more patch files; no reliable change was applied. "
+            "This usually means the patch path does not resolve from the selected target/cwd. "
+            f"Output: {output}"
+        )
     if proc.returncode == 0:
         return True, output or "OK"
     return False, output or f"git apply failed with exit code {proc.returncode}"
@@ -446,6 +493,7 @@ def run_git_apply_patch(
 class PatchApplyPlan:
     root: Path
     strip_level: int
+    patch_directory: str | None
     check_output: str
     attempts: tuple[str, ...]
 
@@ -475,6 +523,32 @@ def _candidate_patch_roots(profile_root: Path) -> list[Path]:
         parent = parent.parent
         candidates.append(parent)
     return _unique_existing_paths(candidates)
+
+
+def _candidate_patch_directories(root: Path, profile_root: Path) -> list[str | None]:
+    candidates: list[str | None] = [None]
+    try:
+        rel = profile_root.resolve().relative_to(root.resolve())
+    except ValueError:
+        rel = None
+    except Exception:
+        rel = None
+
+    if rel and rel.parts:
+        rel_posix = rel.as_posix()
+        if rel_posix and rel_posix != ".":
+            candidates.append(rel_posix)
+
+    out: list[str | None] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = _normalize_patch_directory(candidate)
+        key = normalized or ""
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(normalized)
+    return out
 
 
 def _split_diff_git_paths(payload: str) -> list[str]:
@@ -583,6 +657,7 @@ def _score_patch_candidate(
     *,
     root: Path,
     strip_level: int,
+    patch_directory: str | None,
     reference_raw_paths: tuple[str, ...],
     all_raw_paths: tuple[str, ...],
 ) -> int:
@@ -591,12 +666,16 @@ def _score_patch_candidate(
     existing_score = 0
     for raw in reference_raw_paths:
         rel = _strip_patch_path(raw, strip_level)
+        if rel:
+            rel = _prepend_patch_directory(rel, patch_directory)
         if rel and _rel_exists(root, rel):
             existing_score += 1
 
     parent_score = 0
     for raw in all_raw_paths:
         rel = _strip_patch_path(raw, strip_level)
+        if rel:
+            rel = _prepend_patch_directory(rel, patch_directory)
         if rel and _rel_parent_exists(root, rel):
             parent_score += 1
 
@@ -628,19 +707,22 @@ def detect_git_apply_plan(
     roots = _candidate_patch_roots(profile_root)
     levels = _candidate_strip_levels(preferred_strip_level, raw_paths)
 
-    ranked: list[tuple[int, int, int, Path, int]] = []
+    ranked: list[tuple[int, int, int, int, Path, int, str | None]] = []
     for root_index, root in enumerate(roots):
-        for level_index, strip_level in enumerate(levels):
-            if not _strip_level_possible(raw_paths, strip_level):
-                continue
-            score = _score_patch_candidate(
-                root=root,
-                strip_level=strip_level,
-                reference_raw_paths=reference_raw_paths,
-                all_raw_paths=raw_paths,
-            )
-            # Higher score first. root_index and level_index preserve stable fallback order.
-            ranked.append((-score, root_index, level_index, root, strip_level))
+        directories = _candidate_patch_directories(root, profile_root)
+        for dir_index, patch_directory in enumerate(directories):
+            for level_index, strip_level in enumerate(levels):
+                if not _strip_level_possible(raw_paths, strip_level):
+                    continue
+                score = _score_patch_candidate(
+                    root=root,
+                    strip_level=strip_level,
+                    patch_directory=patch_directory,
+                    reference_raw_paths=reference_raw_paths,
+                    all_raw_paths=raw_paths,
+                )
+                # Higher score first. root/dir/level indexes preserve stable fallback order.
+                ranked.append((-score, root_index, dir_index, level_index, root, strip_level, patch_directory))
 
     if not ranked:
         raise RuntimeError("No valid strip level can be derived from this patch header.")
@@ -650,9 +732,10 @@ def detect_git_apply_plan(
     best_failed_score = -1
     best_failed_root: Path | None = None
     best_failed_strip_level: int | None = None
+    best_failed_patch_directory: str | None = None
     best_failed_output = ""
 
-    for neg_score, _root_index, _level_index, root, strip_level in ranked:
+    for neg_score, _root_index, _dir_index, _level_index, root, strip_level, patch_directory in ranked:
         score = -neg_score
         ok, output = run_git_apply_patch(
             root=root,
@@ -660,23 +743,34 @@ def detect_git_apply_plan(
             strip_level=strip_level,
             reverse=reverse,
             check_only=True,
+            patch_directory=patch_directory,
         )
         marker = "OK" if ok else "FAIL"
-        attempts.append(f"{marker} cwd={root} -p{strip_level} score={score}: {_short_first_error(output)}")
+        directory_text = f" --directory={patch_directory}" if patch_directory else ""
+        attempts.append(f"{marker} cwd={root}{directory_text} -p{strip_level} score={score}: {_short_first_error(output)}")
         if ok:
-            return PatchApplyPlan(root=root, strip_level=strip_level, check_output=output, attempts=tuple(attempts))
+            return PatchApplyPlan(
+                root=root,
+                strip_level=strip_level,
+                patch_directory=patch_directory,
+                check_output=output,
+                attempts=tuple(attempts),
+            )
         last_error = output
         if score > best_failed_score:
             best_failed_score = score
             best_failed_root = root
             best_failed_strip_level = strip_level
+            best_failed_patch_directory = patch_directory
             best_failed_output = output
 
     detail = "\n".join(attempts[-12:])
     if best_failed_score > 0 and best_failed_root is not None and best_failed_strip_level is not None:
         raise RuntimeError(
             "Patch path resolved, but git apply --check failed. "
-            f"Best candidate: cwd={best_failed_root} -p{best_failed_strip_level} score={best_failed_score}. "
+            f"Best candidate: cwd={best_failed_root}"
+            f"{(' --directory=' + best_failed_patch_directory) if best_failed_patch_directory else ''} "
+            f"-p{best_failed_strip_level} score={best_failed_score}. "
             "This usually means the patch is stale, already partly applied, or the target files differ from the patch base. "
             f"Last error: {_short_first_error(best_failed_output or last_error, 500)}"
             + ("\nAttempts:\n" + detail if detail else "")
@@ -4185,7 +4279,7 @@ class DumpItApp(tk.Tk):
     def _refresh_apply_patch_targets(self) -> None:
         self._refresh_apply_patch_target()
 
-    def _resolve_patch_apply_plan_for_current_ui(self) -> tuple[Path, Path, int, tuple[str, ...]]:
+    def _resolve_patch_apply_plan_for_current_ui(self) -> tuple[Path, Path, int, str | None, tuple[str, ...]]:
         patch_path, strip_level = self._get_patch_path_and_strip_level()
         target = self._get_patch_target_dir()
         reverse = self.patch_reverse.get()
@@ -4197,7 +4291,7 @@ class DumpItApp(tk.Tk):
                 preferred_strip_level=strip_level,
                 reverse=reverse,
             )
-            return patch_path, plan.root, plan.strip_level, plan.attempts
+            return patch_path, plan.root, plan.strip_level, plan.patch_directory, plan.attempts
 
         check_ok, check_output = run_git_apply_patch(
             root=target,
@@ -4208,7 +4302,7 @@ class DumpItApp(tk.Tk):
         )
         if not check_ok:
             raise RuntimeError(check_output)
-        return patch_path, target, strip_level, ()
+        return patch_path, target, strip_level, None, ()
 
     def _open_delta_html_result(self, diff: DumpDiffResult, *, log_label: str) -> Path:
         self._cleanup_diff_temp_html(log=True)
@@ -4237,11 +4331,12 @@ class DumpItApp(tk.Tk):
         self._refresh_apply_patch_target()
         self._begin_apply_patch_operation_log("preview")
         try:
-            patch_path, effective_root, effective_strip, attempts = self._resolve_patch_apply_plan_for_current_ui()
+            patch_path, effective_root, effective_strip, patch_directory, attempts = self._resolve_patch_apply_plan_for_current_ui()
             reverse = self.patch_reverse.get()
 
             self._append_apply_patch_log(
                 f"Patch preview started: {patch_path} -> target={effective_root}, "
+                f"{('--directory=' + patch_directory + ', ') if patch_directory else ''}"
                 f"-p{effective_strip}, reverse={reverse}"
             )
             for attempt in attempts:
@@ -4252,11 +4347,14 @@ class DumpItApp(tk.Tk):
                 patch_path=patch_path,
                 strip_level=effective_strip,
                 reverse=reverse,
+                patch_directory=patch_directory,
             )
 
             out_path = self._open_delta_html_result(diff, log_label="Patch preview")
             status = (
-                f"Patch preview opened. cwd={effective_root}, -p{effective_strip}. "
+                f"Patch preview opened. cwd={effective_root}, "
+                f"{('--directory=' + patch_directory + ', ') if patch_directory else ''}"
+                f"-p{effective_strip}. "
                 f"Added {len(diff.added)}, removed {len(diff.removed)}, "
                 f"modified {len(diff.modified)}, unchanged {len(diff.unchanged)}. "
                 f"HTML: {out_path}"
@@ -4310,12 +4408,17 @@ class DumpItApp(tk.Tk):
                 )
                 effective_root = plan.root
                 effective_strip = plan.strip_level
-                self._append_apply_patch_log(f"[Apply Patch] Plan: cwd={effective_root}, -p{effective_strip}")
+                patch_directory = plan.patch_directory
+                self._append_apply_patch_log(
+                    f"[Apply Patch] Plan: cwd={effective_root}"
+                    f"{(' --directory=' + patch_directory) if patch_directory else ''}, -p{effective_strip}"
+                )
                 for attempt in plan.attempts:
                     self._append_apply_patch_log(f"[Apply Patch]   {attempt}")
             else:
                 effective_root = target
                 effective_strip = strip_level
+                patch_directory = None
                 check_ok, check_output = run_git_apply_patch(
                     root=effective_root,
                     patch_path=patch_path,
@@ -4328,7 +4431,12 @@ class DumpItApp(tk.Tk):
 
             backup_text = ""
             if not dry_run and self.patch_backup.get():
-                backup_dir, backed_up = create_patch_backup(effective_root, patch_path, effective_strip)
+                backup_dir, backed_up = create_patch_backup(
+                    effective_root,
+                    patch_path,
+                    effective_strip,
+                    patch_directory,
+                )
                 if backup_dir:
                     backup_text = f" backup={backup_dir} ({backed_up} file(s))"
                 else:
@@ -4341,11 +4449,16 @@ class DumpItApp(tk.Tk):
                     strip_level=effective_strip,
                     reverse=reverse,
                     check_only=False,
+                    patch_directory=patch_directory,
                 )
                 if not apply_ok:
                     raise RuntimeError(apply_output)
 
-            status = f"Patch {action} completed. OK. cwd={effective_root}, -p{effective_strip}{backup_text}"
+            status = (
+                f"Patch {action} completed. OK. cwd={effective_root}, "
+                f"{('--directory=' + patch_directory + ', ') if patch_directory else ''}"
+                f"-p{effective_strip}{backup_text}"
+            )
             self._set_apply_patch_status(status)
             self._append_apply_patch_log(status)
             messagebox.showinfo("Apply Patch", status)
