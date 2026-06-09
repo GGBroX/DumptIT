@@ -440,6 +440,55 @@ def build_patch_preview_diff(
     return compare_dump_snapshots(before, after)
 
 
+def _hash_file_for_patch_state(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _snapshot_patch_target_state(
+    *,
+    root: Path,
+    patch_path: Path,
+    strip_level: int,
+    patch_directory: str | None = None,
+) -> dict[str, tuple[str, int, str]]:
+    """Capture target file state for the paths referenced by a patch.
+
+    Used after a successful git apply exit code to reject false positives where
+    Git skipped every path and changed nothing.
+    """
+    state: dict[str, tuple[str, int, str]] = {}
+    rel_paths = _collect_patch_preview_rel_paths(patch_path, strip_level, patch_directory)
+
+    for rel in rel_paths:
+        path = _patch_rel_path(root, rel)
+        try:
+            if path.is_file():
+                stat = path.stat()
+                state[rel] = ("file", int(stat.st_size), _hash_file_for_patch_state(path))
+            elif path.exists():
+                state[rel] = ("other", 0, "")
+            else:
+                state[rel] = ("missing", 0, "")
+        except OSError as e:
+            state[rel] = ("error", 0, str(e))
+    return state
+
+
+def _format_patch_state_paths(state: dict[str, tuple[str, int, str]], limit: int = 5) -> str:
+    paths = list(state.keys())
+    if not paths:
+        return "none"
+    sample = paths[:limit]
+    text = ", ".join(sample)
+    if len(paths) > limit:
+        text += f", ... (+{len(paths) - limit})"
+    return text
+
+
 def _git_apply_output_has_skipped_patch(output: str) -> bool:
     return bool(re.search(r"(?im)^\s*Skipped patch ['\"]?.+", output or ""))
 
@@ -468,6 +517,15 @@ def run_git_apply_patch(
     cmd.append(f"-p{strip_level}")
     cmd.append(str(patch_path))
 
+    before_state: dict[str, tuple[str, int, str]] | None = None
+    if not check_only:
+        before_state = _snapshot_patch_target_state(
+            root=root,
+            patch_path=patch_path,
+            strip_level=strip_level,
+            patch_directory=patch_directory,
+        )
+
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system().lower().startswith("win") else 0
     proc = subprocess.run(
         cmd,
@@ -485,6 +543,21 @@ def run_git_apply_patch(
             f"Output: {output}"
         )
     if proc.returncode == 0:
+        if not check_only and before_state is not None:
+            after_state = _snapshot_patch_target_state(
+                root=root,
+                patch_path=patch_path,
+                strip_level=strip_level,
+                patch_directory=patch_directory,
+            )
+            if before_state == after_state:
+                return False, (
+                    "git apply exited with OK, but none of the patch target files changed. "
+                    "Treating this as a failed application because Git most likely skipped the patch paths "
+                    "or the selected cwd/--directory combination is wrong. "
+                    f"Checked paths: {_format_patch_state_paths(after_state)}. "
+                    f"Output: {output or 'OK'}"
+                )
         return True, output or "OK"
     return False, output or f"git apply failed with exit code {proc.returncode}"
 
@@ -496,6 +569,50 @@ class PatchApplyPlan:
     patch_directory: str | None
     check_output: str
     attempts: tuple[str, ...]
+
+
+def _get_git_worktree_root(path: Path) -> Path | None:
+    """Return the Git worktree root for path, if path is inside a worktree.
+
+    git apply behaves differently when executed from a subdirectory of a
+    worktree: paths may be treated relative to the repository root and skipped
+    without a fatal exit code. DumpIt therefore runs patch application from the
+    worktree root and uses --directory for selected subfolders.
+    """
+    git = shutil.which("git")
+    if not git:
+        return None
+
+    try:
+        proc = subprocess.run(
+            [git, "rev-parse", "--show-toplevel"],
+            cwd=str(path),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return None
+
+    try:
+        root = Path(raw).resolve()
+    except Exception:
+        root = Path(raw)
+
+    try:
+        if root.exists() and root.is_dir():
+            return root
+    except OSError:
+        pass
+    return None
 
 
 def _unique_existing_paths(paths: list[Path]) -> list[Path]:
@@ -515,8 +632,16 @@ def _unique_existing_paths(paths: list[Path]) -> list[Path]:
 
 
 def _candidate_patch_roots(profile_root: Path) -> list[Path]:
-    # Batch profiles may point either to the repo root or to a source subfolder such as ./app.
-    # Try the selected folder first, then a small number of parents.
+    # If the selected target is inside a Git worktree, always apply from the
+    # worktree root. Applying from a subfolder can make git apply skip paths
+    # while still returning exit code 0. The selected subfolder is represented
+    # separately through --directory.
+    git_root = _get_git_worktree_root(profile_root)
+    if git_root is not None:
+        return _unique_existing_paths([git_root])
+
+    # Non-Git fallback: Batch profiles may point either to a root folder or to
+    # a source subfolder. Try the selected folder first, then a few parents.
     candidates = [profile_root]
     parent = profile_root
     for _ in range(3):
