@@ -1720,6 +1720,15 @@ def dumpit_patch_plan_to_diff(plan: DumpItPatchPlan) -> DumpDiffResult:
     return compare_dump_snapshots(before, after)
 
 
+def _write_dumpit_patch_text(path: Path, text: str, *, encoding: str) -> None:
+    # Important on Windows: the text is already rendered with the target file
+    # newline convention.  Using the default text newline translation would turn
+    # rendered CRLF (\r\n) into CRCRLF (\r\r\n), which appears as blank
+    # lines inserted after every physical line.
+    with path.open("w", encoding=encoding, newline="") as handle:
+        handle.write(text)
+
+
 def execute_dumpit_patch_plan(plan: DumpItPatchPlan) -> tuple[int, int]:
     if plan.failed:
         raise RuntimeError(
@@ -1739,7 +1748,7 @@ def execute_dumpit_patch_plan(plan: DumpItPatchPlan) -> tuple[int, int]:
             continue
         ensure_parent_dir(file_result.target_path)
         text = file_result.after_text or ""
-        file_result.target_path.write_text(text, encoding=file_result.encoding)
+        _write_dumpit_patch_text(file_result.target_path, text, encoding=file_result.encoding)
         written += 1
     return written, deleted
 
