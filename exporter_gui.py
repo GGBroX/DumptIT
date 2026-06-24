@@ -25,7 +25,6 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
-
 APP_NAME = "DumpIt"
 CONFIG_FILE_NAME = "dumpit.ini"
 
