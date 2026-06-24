@@ -921,6 +921,8 @@ class DumpItPatchHunkResult:
     hunk_index: int
     status: str
     line_no: int | None = None
+    expected_line_no: int | None = None
+    hunk_header: str = ""
     detail: str = ""
 
     @property
@@ -1108,6 +1110,10 @@ def _effective_hunk_blocks(hunk: UnifiedPatchHunk, *, reverse: bool) -> tuple[in
     return int(hunk.old_start), _hunk_old_lines(hunk), _hunk_new_lines(hunk)
 
 
+def _dumpit_patch_hunk_header(hunk: UnifiedPatchHunk) -> str:
+    return f"@@ -{hunk.old_start},{hunk.old_count} +{hunk.new_start},{hunk.new_count} @@{(' ' + hunk.section) if hunk.section else ''}"
+
+
 def _effective_patch_paths(patch_file: UnifiedPatchFile, *, reverse: bool) -> tuple[str, str, str, bool, bool]:
     effective_old = patch_file.new_path if reverse else patch_file.old_path
     effective_new = patch_file.old_path if reverse else patch_file.new_path
@@ -1189,6 +1195,35 @@ def _match_block_at_line(lines: list[str], start_line: int, block: list[str]) ->
     return None
 
 
+def _choose_nearest_unique_match(matches: list[int], start_line: int) -> int | None:
+    if not matches:
+        return None
+    expected_idx = max(0, int(start_line or 1) - 1)
+    distances = [(abs(int(match) - expected_idx), int(match)) for match in matches]
+    distances.sort()
+    if len(distances) == 1:
+        return distances[0][1]
+    if distances[0][0] != distances[1][0]:
+        return distances[0][1]
+    return None
+
+
+def _format_dumpit_patch_excerpt(lines: list[str], start_line: int, *, radius: int = 4) -> str:
+    if not lines:
+        return "actual excerpt: <empty file>"
+    expected = max(1, int(start_line or 1))
+    start = max(1, expected - max(1, int(radius)))
+    end = min(len(lines), expected + max(1, int(radius)))
+    if start > len(lines):
+        start = max(1, len(lines) - max(1, int(radius)) + 1)
+        end = len(lines)
+    out = ["actual excerpt:"]
+    for line_no in range(start, end + 1):
+        marker = ">" if line_no == expected else " "
+        out.append(f"  {marker} {line_no}: {lines[line_no - 1]}")
+    return "\n".join(out)
+
+
 def _resolve_dumpit_hunk(
     *,
     rel_path: str,
@@ -1197,9 +1232,11 @@ def _resolve_dumpit_hunk(
     start_line: int,
     old_block: list[str],
     new_block: list[str],
+    hunk_header: str = "",
     allow_empty_exact: bool = True,
 ) -> tuple[DumpItPatchHunkResult, list[str]]:
-    exact_idx = _match_block_at_line(lines, start_line, old_block)
+    expected_line = max(1, int(start_line or 1))
+    exact_idx = _match_block_at_line(lines, expected_line, old_block)
     if exact_idx is not None and (old_block or allow_empty_exact):
         updated = list(lines)
         updated[exact_idx:exact_idx + len(old_block)] = new_block
@@ -1209,7 +1246,9 @@ def _resolve_dumpit_hunk(
                 hunk_index=hunk_index,
                 status=DUMPIT_PATCH_STATUS_APPLICABLE_EXACT,
                 line_no=exact_idx + 1,
-                detail="old block matched at patch line",
+                expected_line_no=expected_line,
+                hunk_header=hunk_header,
+                detail="old block matched at effective patch line",
             ),
             updated,
         )
@@ -1225,17 +1264,37 @@ def _resolve_dumpit_hunk(
                 hunk_index=hunk_index,
                 status=DUMPIT_PATCH_STATUS_APPLICABLE_RELOCATED,
                 line_no=idx + 1,
-                detail="old block found once away from patch line",
+                expected_line_no=expected_line,
+                hunk_header=hunk_header,
+                detail="old block found once away from effective patch line",
             ),
             updated,
         )
     if len(old_matches) > 1:
+        idx = _choose_nearest_unique_match(old_matches, expected_line)
+        if idx is not None:
+            updated = list(lines)
+            updated[idx:idx + len(old_block)] = new_block
+            return (
+                DumpItPatchHunkResult(
+                    file_path=rel_path,
+                    hunk_index=hunk_index,
+                    status=DUMPIT_PATCH_STATUS_APPLICABLE_RELOCATED,
+                    line_no=idx + 1,
+                    expected_line_no=expected_line,
+                    hunk_header=hunk_header,
+                    detail=f"old block matched {len(old_matches)} times; nearest unique match selected by effective patch line",
+                ),
+                updated,
+            )
         return (
             DumpItPatchHunkResult(
                 file_path=rel_path,
                 hunk_index=hunk_index,
                 status=DUMPIT_PATCH_STATUS_FAILED_AMBIGUOUS,
-                detail=f"old block matched {len(old_matches)} times",
+                expected_line_no=expected_line,
+                hunk_header=hunk_header,
+                detail=f"old block matched {len(old_matches)} times; nearest match is not unique",
             ),
             lines,
         )
@@ -1248,17 +1307,35 @@ def _resolve_dumpit_hunk(
                 hunk_index=hunk_index,
                 status=DUMPIT_PATCH_STATUS_ALREADY_APPLIED,
                 line_no=new_matches[0] + 1,
+                expected_line_no=expected_line,
+                hunk_header=hunk_header,
                 detail="new block already present once",
             ),
             lines,
         )
     if len(new_matches) > 1:
+        idx = _choose_nearest_unique_match(new_matches, expected_line)
+        if idx is not None:
+            return (
+                DumpItPatchHunkResult(
+                    file_path=rel_path,
+                    hunk_index=hunk_index,
+                    status=DUMPIT_PATCH_STATUS_ALREADY_APPLIED,
+                    line_no=idx + 1,
+                    expected_line_no=expected_line,
+                    hunk_header=hunk_header,
+                    detail=f"new block matched {len(new_matches)} times; nearest unique match selected as already applied",
+                ),
+                lines,
+            )
         return (
             DumpItPatchHunkResult(
                 file_path=rel_path,
                 hunk_index=hunk_index,
                 status=DUMPIT_PATCH_STATUS_FAILED_AMBIGUOUS,
-                detail=f"new block matched {len(new_matches)} times",
+                expected_line_no=expected_line,
+                hunk_header=hunk_header,
+                detail=f"new block matched {len(new_matches)} times; nearest match is not unique",
             ),
             lines,
         )
@@ -1268,7 +1345,13 @@ def _resolve_dumpit_hunk(
             file_path=rel_path,
             hunk_index=hunk_index,
             status=DUMPIT_PATCH_STATUS_FAILED_NOT_FOUND,
-            detail="neither old block nor new block was found",
+            expected_line_no=expected_line,
+            hunk_header=hunk_header,
+            detail=(
+                "neither old block nor new block was found; "
+                f"expected around line {expected_line}\n"
+                f"{_format_dumpit_patch_excerpt(lines, expected_line)}"
+            ),
         ),
         lines,
     )
@@ -1422,20 +1505,25 @@ def build_dumpit_patch_plan(
                     )
             after_text = doc.before_text
         else:
+            cumulative_line_delta = 0
             for hunk_index, hunk in enumerate(patch_file.hunks, start=1):
                 start_line, old_block, new_block = _effective_hunk_blocks(hunk, reverse=reverse)
+                effective_start_line = max(1, int(start_line or 1) + int(cumulative_line_delta))
                 result, updated_lines = _resolve_dumpit_hunk(
                     rel_path=rel,
                     hunk_index=hunk_index,
                     lines=current_lines,
-                    start_line=start_line,
+                    start_line=effective_start_line,
                     old_block=old_block,
                     new_block=new_block,
+                    hunk_header=_dumpit_patch_hunk_header(hunk),
                     allow_empty_exact=bool(is_create or not existed),
                 )
                 file_hunk_results.append(result)
-                if not result.failed and result.status != DUMPIT_PATCH_STATUS_ALREADY_APPLIED:
-                    current_lines = updated_lines
+                if not result.failed:
+                    cumulative_line_delta += len(new_block) - len(old_block)
+                    if result.status != DUMPIT_PATCH_STATUS_ALREADY_APPLIED:
+                        current_lines = updated_lines
 
             after_text = None if is_delete and not any(item.failed for item in file_hunk_results) else _render_dumpit_patch_lines(
                 current_lines,
@@ -1470,14 +1558,21 @@ def build_dumpit_patch_plan(
     )
 
 
+def _dumpit_patch_hunk_detail_line(file_result: DumpItPatchFileResult, hunk: DumpItPatchHunkResult) -> str:
+    line_text = f" line={hunk.line_no}" if hunk.line_no is not None else ""
+    expected_text = f" expected={hunk.expected_line_no}" if hunk.expected_line_no is not None else ""
+    header_text = f" {hunk.hunk_header}" if hunk.hunk_header else ""
+    detail_text = f" {hunk.detail}" if hunk.detail else ""
+    return f"{file_result.rel_path} hunk {hunk.hunk_index}:{header_text} {hunk.status}{line_text}{expected_text}{detail_text}".strip()
+
+
 def _dumpit_patch_plan_failure_detail(plan: DumpItPatchPlan, max_items: int = 5) -> str:
     details: list[str] = []
     details.extend(plan.parse_errors[:max_items])
     for file_result in plan.files:
         for hunk in file_result.hunk_results:
             if hunk.failed:
-                line_text = f" line={hunk.line_no}" if hunk.line_no is not None else ""
-                details.append(f"{file_result.rel_path} hunk {hunk.hunk_index}: {hunk.status}{line_text} {hunk.detail}".strip())
+                details.append(_dumpit_patch_hunk_detail_line(file_result, hunk))
                 if len(details) >= max_items:
                     break
         if len(details) >= max_items:
@@ -1486,6 +1581,12 @@ def _dumpit_patch_plan_failure_detail(plan: DumpItPatchPlan, max_items: int = 5)
         return "no failure detail"
     suffix = "" if len(details) < max_items else " ..."
     return "; ".join(details) + suffix
+
+
+def _filter_dumpit_patch_attempts_for_log(attempts: list[str]) -> list[str]:
+    if not any("score=" in item and "score=0" not in item for item in attempts):
+        return list(attempts)
+    return [item for item in attempts if "score=0" not in item]
 
 
 def detect_dumpit_apply_plan(
@@ -1563,7 +1664,8 @@ def detect_dumpit_apply_plan(
             best_failed_strip_level = strip_level
             best_failed_patch_directory = _normalize_patch_directory(patch_directory)
 
-    detail = "\n".join(attempts[-12:])
+    display_attempts = _filter_dumpit_patch_attempts_for_log(attempts)
+    detail = "\n".join(display_attempts[-12:])
     if best_failed_plan is not None and best_failed_root is not None and best_failed_strip_level is not None:
         raise RuntimeError(
             "DumpIt apply resolved patch paths, but one or more hunks failed. "
@@ -4193,8 +4295,10 @@ class DumpItApp(tk.Tk):
             self._append_apply_patch_log(f"{prefix} File {file_result.rel_path} action={file_result.action}")
             for hunk in file_result.hunk_results:
                 line_text = f" line={hunk.line_no}" if hunk.line_no is not None else ""
+                expected_text = f" expected={hunk.expected_line_no}" if hunk.expected_line_no is not None else ""
+                header_text = f" {hunk.hunk_header}" if hunk.hunk_header else ""
                 detail_text = f" — {hunk.detail}" if hunk.detail else ""
-                self._append_apply_patch_log(f"{prefix}   Hunk {hunk.hunk_index}: {hunk.status}{line_text}{detail_text}")
+                self._append_apply_patch_log(f"{prefix}   Hunk {hunk.hunk_index}:{header_text} {hunk.status}{line_text}{expected_text}{detail_text}")
         for error in plan.parse_errors:
             self._append_apply_patch_log(f"{prefix} ERROR {error}")
 
