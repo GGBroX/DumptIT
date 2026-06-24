@@ -912,6 +912,8 @@ def detect_git_apply_plan(
 # ---------- DumpIt transactional patch engine ----------
 DUMPIT_PATCH_STATUS_APPLICABLE_EXACT = "APPLICABLE_EXACT"
 DUMPIT_PATCH_STATUS_APPLICABLE_EXACT_EOF_CONTEXT = "APPLICABLE_EXACT_EOF_CONTEXT"
+DUMPIT_PATCH_STATUS_APPLICABLE_EXACT_OFFSET = "APPLICABLE_EXACT_OFFSET"
+DUMPIT_PATCH_STATUS_APPLICABLE_EXACT_OFFSET_EOF_CONTEXT = "APPLICABLE_EXACT_OFFSET_EOF_CONTEXT"
 DUMPIT_PATCH_STATUS_APPLICABLE_RELOCATED = "APPLICABLE_RELOCATED"
 DUMPIT_PATCH_STATUS_APPLICABLE_RELOCATED_EOF_CONTEXT = "APPLICABLE_RELOCATED_EOF_CONTEXT"
 DUMPIT_PATCH_STATUS_ALREADY_APPLIED = "ALREADY_APPLIED"
@@ -1254,18 +1256,24 @@ def _resolve_dumpit_hunk(
     old_block: list[str],
     new_block: list[str],
     allow_empty_exact: bool = True,
+    adjusted_from_line: int | None = None,
 ) -> tuple[DumpItPatchHunkResult, list[str]]:
     exact_idx = _match_block_at_line(lines, start_line, old_block)
     if exact_idx is not None and (old_block or allow_empty_exact):
         updated = list(lines)
         updated[exact_idx:exact_idx + len(old_block)] = new_block
+        adjusted = adjusted_from_line is not None and int(adjusted_from_line) != int(start_line)
         return (
             DumpItPatchHunkResult(
                 file_path=rel_path,
                 hunk_index=hunk_index,
-                status=DUMPIT_PATCH_STATUS_APPLICABLE_EXACT,
+                status=DUMPIT_PATCH_STATUS_APPLICABLE_EXACT_OFFSET if adjusted else DUMPIT_PATCH_STATUS_APPLICABLE_EXACT,
                 line_no=exact_idx + 1,
-                detail="old block matched at patch line",
+                detail=(
+                    f"old block matched at adjusted patch line {start_line} from original {adjusted_from_line}"
+                    if adjusted
+                    else "old block matched at patch line"
+                ),
             ),
             updated,
         )
@@ -1326,13 +1334,22 @@ def _resolve_dumpit_hunk(
         if eof_exact_idx is not None and eof_exact_idx + len(eof_old_block) == len(lines):
             updated = list(lines)
             updated[eof_exact_idx:eof_exact_idx + len(eof_old_block)] = eof_new_block
+            adjusted = adjusted_from_line is not None and int(adjusted_from_line) != int(start_line)
             return (
                 DumpItPatchHunkResult(
                     file_path=rel_path,
                     hunk_index=hunk_index,
-                    status=DUMPIT_PATCH_STATUS_APPLICABLE_EXACT_EOF_CONTEXT,
+                    status=(
+                        DUMPIT_PATCH_STATUS_APPLICABLE_EXACT_OFFSET_EOF_CONTEXT
+                        if adjusted
+                        else DUMPIT_PATCH_STATUS_APPLICABLE_EXACT_EOF_CONTEXT
+                    ),
                     line_no=eof_exact_idx + 1,
-                    detail="old block matched at EOF after trimming one trailing empty context line",
+                    detail=(
+                        f"old block matched at adjusted EOF patch line {start_line} from original {adjusted_from_line} after trimming one trailing empty context line"
+                        if adjusted
+                        else "old block matched at EOF after trimming one trailing empty context line"
+                    ),
                 ),
                 updated,
             )
@@ -1524,20 +1541,25 @@ def build_dumpit_patch_plan(
                     )
             after_text = doc.before_text
         else:
+            line_offset = 0
             for hunk_index, hunk in enumerate(patch_file.hunks, start=1):
                 start_line, old_block, new_block = _effective_hunk_blocks(hunk, reverse=reverse)
+                adjusted_start_line = max(1, int(start_line or 1) + int(line_offset))
                 result, updated_lines = _resolve_dumpit_hunk(
                     rel_path=rel,
                     hunk_index=hunk_index,
                     lines=current_lines,
-                    start_line=start_line,
+                    start_line=adjusted_start_line,
                     old_block=old_block,
                     new_block=new_block,
                     allow_empty_exact=bool(is_create or not existed),
+                    adjusted_from_line=start_line if adjusted_start_line != int(start_line or 1) else None,
                 )
                 file_hunk_results.append(result)
-                if not result.failed and result.status != DUMPIT_PATCH_STATUS_ALREADY_APPLIED:
-                    current_lines = updated_lines
+                if not result.failed:
+                    if result.status != DUMPIT_PATCH_STATUS_ALREADY_APPLIED:
+                        current_lines = updated_lines
+                    line_offset += len(new_block) - len(old_block)
 
             after_text = None if is_delete and not any(item.failed for item in file_hunk_results) else _render_dumpit_patch_lines(
                 current_lines,
