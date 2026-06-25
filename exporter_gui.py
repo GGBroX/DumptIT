@@ -2601,9 +2601,27 @@ def _html_escape(text: str) -> str:
     return html_lib.escape(text, quote=False)
 
 
-def _render_html_diff_table(old_text: str, new_text: str) -> str:
-    old_lines = old_text.splitlines()
-    new_lines = new_text.splitlines()
+DIFF_HTML_CONTEXT_LINES = 3
+
+
+def _render_html_skip_row(old_gap: int, new_gap: int) -> str:
+    hidden = max(0, int(old_gap), int(new_gap))
+    label = f"… {hidden} unchanged line{'s' if hidden != 1 else ''} hidden …"
+    return (
+        "<tr class='skip'>"
+        "<td class='ln'></td><td class='code skip-code' colspan='3'>"
+        f"{_html_escape(label)}"
+        "</td></tr>"
+    )
+
+
+def _render_html_diff_rows(
+    old_lines: list[str],
+    new_lines: list[str],
+    *,
+    old_base: int = 0,
+    new_base: int = 0,
+) -> list[str]:
     matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
     rows: list[str] = []
 
@@ -2623,8 +2641,8 @@ def _render_html_diff_table(old_text: str, new_text: str) -> str:
             new_index = j1 + offset
             has_old = old_index < i2
             has_new = new_index < j2
-            old_no = str(old_index + 1) if has_old else ""
-            new_no = str(new_index + 1) if has_new else ""
+            old_no = str(old_base + old_index + 1) if has_old else ""
+            new_no = str(new_base + new_index + 1) if has_new else ""
             old_line = _html_escape(old_lines[old_index]) if has_old else ""
             new_line = _html_escape(new_lines[new_index]) if has_new else ""
             rows.append(
@@ -2634,8 +2652,67 @@ def _render_html_diff_table(old_text: str, new_text: str) -> str:
                 "</tr>".format(css=css, old_no=old_no, old_line=old_line, new_no=new_no, new_line=new_line)
             )
 
-    if not rows:
+    return rows
+
+
+def _collect_diff_hunk_ranges(old_lines: list[str], new_lines: list[str], *, context_lines: int) -> list[tuple[int, int, int, int]]:
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines)
+    ranges: list[tuple[int, int, int, int]] = []
+    context = max(0, int(context_lines))
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        old_start = max(0, i1 - context)
+        old_end = min(len(old_lines), i2 + context)
+        new_start = max(0, j1 - context)
+        new_end = min(len(new_lines), j2 + context)
+        if ranges and old_start <= ranges[-1][1] and new_start <= ranges[-1][3]:
+            prev_old_start, prev_old_end, prev_new_start, prev_new_end = ranges[-1]
+            ranges[-1] = (
+                prev_old_start,
+                max(prev_old_end, old_end),
+                prev_new_start,
+                max(prev_new_end, new_end),
+            )
+        else:
+            ranges.append((old_start, old_end, new_start, new_end))
+
+    return ranges
+
+
+def _render_html_diff_table(old_text: str, new_text: str) -> str:
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    ranges = _collect_diff_hunk_ranges(old_lines, new_lines, context_lines=DIFF_HTML_CONTEXT_LINES)
+    rows: list[str] = []
+
+    if not ranges:
         rows.append("<tr class='eq'><td></td><td class='code'>No line differences.</td><td></td><td></td></tr>")
+        return "<table class='diff-table'><tbody>" + "\n".join(rows) + "</tbody></table>"
+
+    previous_old_end = 0
+    previous_new_end = 0
+    for old_start, old_end, new_start, new_end in ranges:
+        hidden_old = max(0, old_start - previous_old_end)
+        hidden_new = max(0, new_start - previous_new_end)
+        if hidden_old or hidden_new:
+            rows.append(_render_html_skip_row(hidden_old, hidden_new))
+        rows.extend(
+            _render_html_diff_rows(
+                old_lines[old_start:old_end],
+                new_lines[new_start:new_end],
+                old_base=old_start,
+                new_base=new_start,
+            )
+        )
+        previous_old_end = old_end
+        previous_new_end = new_end
+
+    hidden_old = max(0, len(old_lines) - previous_old_end)
+    hidden_new = max(0, len(new_lines) - previous_new_end)
+    if hidden_old or hidden_new:
+        rows.append(_render_html_skip_row(hidden_old, hidden_new))
 
     return "<table class='diff-table'><tbody>" + "\n".join(rows) + "</tbody></table>"
 
@@ -2743,6 +2820,8 @@ main {{ padding: 18px 42px 18px 18px; overflow: hidden; }}
 .badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 800; letter-spacing: .04em; }}
 .diff-table {{ width: 100%; border-collapse: collapse; table-layout: fixed; font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
 .diff-table td {{ border-bottom: 1px solid rgba(255,255,255,.04); vertical-align: top; }}
+tr.skip .skip-code {{ padding: 7px 10px; color: var(--muted); text-align: center; background: #0b1020; font-style: italic; }}
+tr.skip .ln {{ background: #0b1020; }}
 .ln {{ width: 56px; padding: 3px 8px; color: var(--muted); text-align: right; user-select: none; background: rgba(0,0,0,.16); }}
 .code {{ width: calc(50% - 56px); padding: 3px 10px; white-space: pre-wrap; word-break: break-word; }}
 tr.eq .code {{ background: var(--eq); color: #d1d5db; }}
