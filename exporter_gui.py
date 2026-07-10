@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Optional, Set, Callable
 from dataclasses import dataclass
 
-
 import os
 import sys
 import platform
@@ -1221,6 +1220,47 @@ def _find_unique_eof_context_block(lines: list[str], block: list[str]) -> int | 
     return idx
 
 
+def _already_applied_by_contained_old_block(
+    *,
+    rel_path: str,
+    hunk_index: int,
+    lines: list[str],
+    old_block: list[str],
+    new_block: list[str],
+) -> DumpItPatchHunkResult | None:
+    """Detect idempotent insertion hunks where NEW contains OLD as context.
+
+    A normal insertion hunk often has OLD as the unchanged suffix/prefix of NEW.
+    After the patch has already been applied, the OLD block is still present
+    inside the NEW block.  If the engine searches OLD before NEW, it can keep
+    inserting the same new block forever.
+
+    This is still strict textual matching: the NEW block must exist exactly once
+    and the matched OLD block must be wholly contained in that NEW match.
+    """
+    if not old_block or not new_block:
+        return None
+    if len(new_block) <= len(old_block):
+        return None
+    new_matches = _find_exact_block(lines, new_block)
+    if len(new_matches) != 1:
+        return None
+    new_idx = int(new_matches[0])
+    new_end = new_idx + len(new_block)
+    old_matches = _find_exact_block(lines, old_block)
+    for old_idx in old_matches:
+        old_end = int(old_idx) + len(old_block)
+        if new_idx <= int(old_idx) and old_end <= new_end:
+            return DumpItPatchHunkResult(
+                file_path=rel_path,
+                hunk_index=hunk_index,
+                status=DUMPIT_PATCH_STATUS_ALREADY_APPLIED,
+                line_no=new_idx + 1,
+                detail="new block already present once and contains the old context block",
+            )
+    return None
+
+
 def _resolve_dumpit_hunk(
     *,
     rel_path: str,
@@ -1232,6 +1272,16 @@ def _resolve_dumpit_hunk(
     allow_empty_exact: bool = True,
     adjusted_from_line: int | None = None,
 ) -> tuple[DumpItPatchHunkResult, list[str]]:
+    contained_already_applied = _already_applied_by_contained_old_block(
+        rel_path=rel_path,
+        hunk_index=hunk_index,
+        lines=lines,
+        old_block=old_block,
+        new_block=new_block,
+    )
+    if contained_already_applied is not None:
+        return contained_already_applied, lines
+
     exact_idx = _match_block_at_line(lines, start_line, old_block)
     if exact_idx is not None and (old_block or allow_empty_exact):
         updated = list(lines)
@@ -1304,6 +1354,16 @@ def _resolve_dumpit_hunk(
     eof_blocks = _trim_single_trailing_empty_context(old_block, new_block)
     if eof_blocks is not None:
         eof_old_block, eof_new_block = eof_blocks
+        eof_contained_already_applied = _already_applied_by_contained_old_block(
+            rel_path=rel_path,
+            hunk_index=hunk_index,
+            lines=lines,
+            old_block=eof_old_block,
+            new_block=eof_new_block,
+        )
+        if eof_contained_already_applied is not None:
+            return eof_contained_already_applied, lines
+
         eof_exact_idx = _match_block_at_line(lines, start_line, eof_old_block)
         if eof_exact_idx is not None and eof_exact_idx + len(eof_old_block) == len(lines):
             updated = list(lines)
