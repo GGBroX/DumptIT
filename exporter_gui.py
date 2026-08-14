@@ -9,6 +9,7 @@ import sys
 import platform
 import fnmatch
 import configparser
+import json
 import hashlib
 import difflib
 import html as html_lib
@@ -294,6 +295,213 @@ def _prepend_patch_directory(rel_posix: str, patch_directory: str | None) -> str
     return f"{patch_directory}/{rel_posix}"
 
 
+@dataclass(slots=True, frozen=True)
+class PatchTargetSpec:
+    patch_identity: str
+    raw_path: str
+    action: str
+
+
+@dataclass(slots=True, frozen=True)
+class PatchTargetMapping:
+    patch_identity: str
+    raw_path: str
+    action: str
+    rel_path: str
+    target_path: Path
+
+
+def _collect_patch_target_specs(patch_path: Path, *, reverse: bool) -> tuple[PatchTargetSpec, ...]:
+    """Return one effective target path per patch file.
+
+    The mapping is derived from complete ``diff --git`` blocks so a/... and
+    b/... header aliases never count as two independent files.
+    """
+    text = read_text_safely(patch_path)
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            if current:
+                blocks.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    specs: list[PatchTargetSpec] = []
+    for block_index, block in enumerate(blocks, start=1):
+        header = block[0][len("diff --git "):].strip()
+        header_paths = _split_diff_git_paths(header)
+        diff_old = header_paths[0] if len(header_paths) >= 1 else ""
+        diff_new = header_paths[1] if len(header_paths) >= 2 else diff_old
+
+        old_raw = ""
+        new_raw = ""
+        is_new_file = False
+        is_deleted_file = False
+        for line in block[1:]:
+            if line.startswith("new file mode "):
+                is_new_file = True
+            elif line.startswith("deleted file mode "):
+                is_deleted_file = True
+            elif line.startswith("--- "):
+                old_raw = line[4:].strip()
+            elif line.startswith("+++ "):
+                new_raw = line[4:].strip()
+
+        old_norm = _normalize_patch_raw_path(old_raw or diff_old)
+        new_norm = _normalize_patch_raw_path(new_raw or diff_new)
+        old_is_null = old_norm == "/dev/null"
+        new_is_null = new_norm == "/dev/null"
+
+        forward_action = "modify"
+        if old_is_null or is_new_file:
+            forward_action = "create"
+        elif new_is_null or is_deleted_file:
+            forward_action = "delete"
+
+        if reverse:
+            action = "delete" if forward_action == "create" else "create" if forward_action == "delete" else "modify"
+            effective_raw = old_norm if not old_is_null else new_norm
+        else:
+            action = forward_action
+            effective_raw = new_norm if not new_is_null else old_norm
+
+        if not effective_raw or effective_raw == "/dev/null":
+            continue
+        identity = f"block#{block_index}:{old_norm or '?'}->{new_norm or '?'}"
+        specs.append(PatchTargetSpec(identity, effective_raw, action))
+
+    if specs:
+        return tuple(specs)
+
+    # Plain unified diffs may omit diff --git headers. Pair ---/+++ lines so
+    # the two sides of one file cannot be mistaken for independent patch files.
+    pending_old = ""
+    for pair_index, line in enumerate(text.splitlines(), start=1):
+        if line.startswith("--- "):
+            pending_old = _normalize_patch_raw_path(line[4:].strip())
+            continue
+        if not line.startswith("+++ ") or not pending_old:
+            continue
+        new_norm = _normalize_patch_raw_path(line[4:].strip())
+        old_norm = pending_old
+        pending_old = ""
+        old_is_null = old_norm == "/dev/null"
+        new_is_null = new_norm == "/dev/null"
+        forward_action = "create" if old_is_null else "delete" if new_is_null else "modify"
+        if reverse:
+            action = "delete" if forward_action == "create" else "create" if forward_action == "delete" else "modify"
+            effective_raw = old_norm if not old_is_null else new_norm
+        else:
+            action = forward_action
+            effective_raw = new_norm if not new_is_null else old_norm
+        if effective_raw and effective_raw != "/dev/null":
+            specs.append(
+                PatchTargetSpec(
+                    f"unified#{pair_index}:{old_norm or '?'}->{new_norm or '?'}",
+                    effective_raw,
+                    action,
+                )
+            )
+    if specs:
+        return tuple(specs)
+
+    # Final fallback for non-standard patches exposing only raw path headers.
+    fallback: list[PatchTargetSpec] = []
+    seen: set[str] = set()
+    for raw in collect_patch_raw_paths(patch_path):
+        norm = _normalize_patch_raw_path(raw)
+        if not norm or norm == "/dev/null" or norm in seen:
+            continue
+        seen.add(norm)
+        fallback.append(PatchTargetSpec(f"raw:{norm}", norm, "modify"))
+    return tuple(fallback)
+
+
+def resolve_patch_target_mapping(
+    *,
+    root: Path,
+    patch_path: Path,
+    strip_level: int,
+    reverse: bool,
+    patch_directory: str | None = None,
+    reject_existing_creates: bool = False,
+    containment_root: Path | None = None,
+) -> tuple[PatchTargetMapping, ...]:
+    """Resolve and validate the complete patch-path -> filesystem mapping.
+
+    This is the shared safety boundary for Git apply and DumpIt apply. A
+    candidate is invalid before hunk validation if paths collapse many-to-one,
+    escape the resolved root, or (during auto-detect) a create maps onto an
+    already existing target.
+    """
+    root_resolved = root.resolve()
+    containment_resolved = (containment_root or root).resolve()
+    patch_directory = _normalize_patch_directory(patch_directory)
+    mappings: list[PatchTargetMapping] = []
+    target_owner: dict[str, PatchTargetMapping] = {}
+
+    for spec in _collect_patch_target_specs(patch_path, reverse=reverse):
+        rel = _strip_patch_path(spec.raw_path, strip_level)
+        if not rel:
+            raise ValueError(
+                f"invalid patch mapping: {spec.raw_path!r} does not survive -p{strip_level}"
+            )
+        rel = _prepend_patch_directory(rel, patch_directory)
+        target = _patch_rel_path(root_resolved, rel).resolve(strict=False)
+        try:
+            target.relative_to(root_resolved)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid patch mapping: {spec.raw_path!r} resolves outside cwd {root_resolved}: {target}"
+            ) from exc
+        try:
+            target.relative_to(containment_resolved)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid patch mapping: {spec.raw_path!r} resolves outside selected target "
+                f"{containment_resolved}: {target}"
+            ) from exc
+
+        mapping = PatchTargetMapping(
+            patch_identity=spec.patch_identity,
+            raw_path=spec.raw_path,
+            action=spec.action,
+            rel_path=rel,
+            target_path=target,
+        )
+        key = os.path.normcase(str(target))
+        previous = target_owner.get(key)
+        if previous is not None and previous.patch_identity != mapping.patch_identity:
+            raise ValueError(
+                "invalid patch mapping: multiple patch files resolve to the same target: "
+                f"{previous.raw_path!r} -> {previous.target_path}; "
+                f"{mapping.raw_path!r} -> {mapping.target_path}"
+            )
+        target_owner[key] = mapping
+
+        if reject_existing_creates and mapping.action == "create" and mapping.target_path.exists():
+            raise ValueError(
+                "invalid auto-detect candidate: create-file patch maps onto an existing target: "
+                f"{mapping.raw_path!r} -> {mapping.target_path}"
+            )
+        mappings.append(mapping)
+
+    if not mappings:
+        raise ValueError("No file paths were found in this patch.")
+    return tuple(mappings)
+
+
+def _format_patch_mapping(mapping: tuple[PatchTargetMapping, ...]) -> tuple[str, ...]:
+    return tuple(
+        f"{item.action.upper():6s} {item.raw_path} -> {item.target_path}"
+        for item in mapping
+    )
+
+
 def _collect_patch_preview_rel_paths(
     patch_path: Path,
     strip_level: int,
@@ -478,6 +686,17 @@ def run_git_apply_patch(
     git = shutil.which("git")
     if not git:
         return False, "git.exe not found in PATH. Install Git for Windows or add git.exe to PATH."
+
+    try:
+        resolve_patch_target_mapping(
+            root=root,
+            patch_path=patch_path,
+            strip_level=strip_level,
+            reverse=reverse,
+            patch_directory=patch_directory,
+        )
+    except Exception as exc:
+        return False, f"Patch mapping preflight failed: {exc}"
 
     cmd = [git, "apply"]
     if check_only:
@@ -756,28 +975,32 @@ def _score_patch_candidate(
     root: Path,
     strip_level: int,
     patch_directory: str | None,
-    reference_raw_paths: tuple[str, ...],
+    target_specs: tuple[PatchTargetSpec, ...],
     all_raw_paths: tuple[str, ...],
+    preferred_strip_level: int,
 ) -> int:
-    # Existing reference files are the strongest signal. Parent directories are
-    # weaker but useful for patches containing mostly new files.
+    # Existing files are positive evidence only for modify/delete semantics.
+    # Create targets never gain score merely because a basename already exists.
     existing_score = 0
-    for raw in reference_raw_paths:
-        rel = _strip_patch_path(raw, strip_level)
-        if rel:
-            rel = _prepend_patch_directory(rel, patch_directory)
-        if rel and _rel_exists(root, rel):
-            existing_score += 1
-
     parent_score = 0
-    for raw in all_raw_paths:
-        rel = _strip_patch_path(raw, strip_level)
+    for spec in target_specs:
+        rel = _strip_patch_path(spec.raw_path, strip_level)
         if rel:
             rel = _prepend_patch_directory(rel, patch_directory)
-        if rel and _rel_parent_exists(root, rel):
+        if not rel:
+            continue
+        exists = _rel_exists(root, rel)
+        if spec.action in {"modify", "delete"} and exists:
+            existing_score += 1
+        if _rel_parent_exists(root, rel):
             parent_score += 1
 
-    return existing_score * 1000 + parent_score
+    # Standard Git a/... b/... patches have a strong structural prior for -p1.
+    # Auto-detect may still choose another level, but only when validation gives
+    # it real evidence instead of an unrelated basename hit.
+    canonical_git_bonus = 1_000_000_000 if _patch_has_git_ab_prefix(all_raw_paths) and strip_level == 1 else 0
+    preferred_strip_bonus = 100_000_000 if strip_level == preferred_strip_level else 0
+    return canonical_git_bonus + preferred_strip_bonus + existing_score * 1000 + parent_score
 
 
 def _short_first_error(output: str, max_len: int = 220) -> str:
@@ -798,9 +1021,7 @@ def detect_git_apply_plan(
     last_error = ""
 
     raw_paths = collect_patch_raw_paths(patch_path)
-    reference_raw_paths = collect_patch_side_raw_paths(patch_path, side="new" if reverse else "old")
-    if not reference_raw_paths:
-        reference_raw_paths = raw_paths
+    target_specs = _collect_patch_target_specs(patch_path, reverse=reverse)
 
     roots = _candidate_patch_roots(profile_root)
     levels = _candidate_strip_levels(preferred_strip_level, raw_paths)
@@ -812,18 +1033,37 @@ def detect_git_apply_plan(
             for level_index, strip_level in enumerate(levels):
                 if not _strip_level_possible(raw_paths, strip_level):
                     continue
+                try:
+                    resolve_patch_target_mapping(
+                        root=root,
+                        patch_path=patch_path,
+                        strip_level=strip_level,
+                        reverse=reverse,
+                        patch_directory=patch_directory,
+                        reject_existing_creates=True,
+                        containment_root=profile_root,
+                    )
+                except Exception as exc:
+                    directory_text = f" --directory={patch_directory}" if patch_directory else ""
+                    attempts.append(f"INVALID cwd={root}{directory_text} -p{strip_level}: {exc}")
+                    continue
                 score = _score_patch_candidate(
                     root=root,
                     strip_level=strip_level,
                     patch_directory=patch_directory,
-                    reference_raw_paths=reference_raw_paths,
+                    target_specs=target_specs,
                     all_raw_paths=raw_paths,
+                    preferred_strip_level=preferred_strip_level,
                 )
                 # Higher score first. root/dir/level indexes preserve stable fallback order.
                 ranked.append((-score, root_index, dir_index, level_index, root, strip_level, patch_directory))
 
     if not ranked:
-        raise RuntimeError("No valid strip level can be derived from this patch header.")
+        detail = "\n".join(attempts[-12:])
+        raise RuntimeError(
+            "No safe cwd/-p candidate survived patch mapping preflight."
+            + ("\nAttempts:\n" + detail if detail else "")
+        )
 
     ranked.sort()
 
@@ -1435,6 +1675,13 @@ def build_dumpit_patch_plan(
     reverse: bool,
     patch_directory: str | None = None,
 ) -> DumpItPatchPlan:
+    resolve_patch_target_mapping(
+        root=root,
+        patch_path=patch_path,
+        strip_level=strip_level,
+        reverse=reverse,
+        patch_directory=patch_directory,
+    )
     patch_files = parse_unified_patch(patch_path)
     results: list[DumpItPatchFileResult] = []
     parse_errors: list[str] = []
@@ -1655,9 +1902,7 @@ def detect_dumpit_apply_plan(
 ) -> DumpItPatchApplyPlan:
     attempts: list[str] = []
     raw_paths = collect_patch_raw_paths(patch_path)
-    reference_raw_paths = collect_patch_side_raw_paths(patch_path, side="new" if reverse else "old")
-    if not reference_raw_paths:
-        reference_raw_paths = raw_paths
+    target_specs = _collect_patch_target_specs(patch_path, reverse=reverse)
 
     roots = _candidate_patch_roots(profile_root)
     levels = _candidate_strip_levels(preferred_strip_level, raw_paths)
@@ -1668,17 +1913,36 @@ def detect_dumpit_apply_plan(
             for level_index, strip_level in enumerate(levels):
                 if not _strip_level_possible(raw_paths, strip_level):
                     continue
+                try:
+                    resolve_patch_target_mapping(
+                        root=root,
+                        patch_path=patch_path,
+                        strip_level=strip_level,
+                        reverse=reverse,
+                        patch_directory=patch_directory,
+                        reject_existing_creates=True,
+                        containment_root=profile_root,
+                    )
+                except Exception as exc:
+                    directory_text = f" --directory={patch_directory}" if patch_directory else ""
+                    attempts.append(f"INVALID cwd={root}{directory_text} -p{strip_level}: {exc}")
+                    continue
                 score = _score_patch_candidate(
                     root=root,
                     strip_level=strip_level,
                     patch_directory=patch_directory,
-                    reference_raw_paths=reference_raw_paths,
+                    target_specs=target_specs,
                     all_raw_paths=raw_paths,
+                    preferred_strip_level=preferred_strip_level,
                 )
                 ranked.append((-score, root_index, dir_index, level_index, root, strip_level, patch_directory))
 
     if not ranked:
-        raise RuntimeError("No valid strip level can be derived from this patch header.")
+        detail = "\n".join(attempts[-12:])
+        raise RuntimeError(
+            "No safe cwd/-p candidate survived patch mapping preflight."
+            + ("\nAttempts:\n" + detail if detail else "")
+        )
 
     ranked.sort()
     best_failed_score = -1
@@ -1733,6 +1997,224 @@ def detect_dumpit_apply_plan(
         )
 
     raise RuntimeError("No valid DumpIt apply cwd/-p combination found." + ("\nAttempts:\n" + detail if detail else ""))
+
+
+@dataclass(slots=True, frozen=True)
+class PatchOperationResolution:
+    engine: str
+    patch_path: Path
+    patch_sha256: str
+    requested_root: Path
+    requested_strip_level: int
+    reverse: bool
+    auto_detect: bool
+    root: Path
+    strip_level: int
+    patch_directory: str | None
+    mapping: tuple[PatchTargetMapping, ...]
+    attempts: tuple[str, ...]
+
+    @property
+    def differs_from_requested(self) -> bool:
+        return (
+            self.root.resolve() != self.requested_root.resolve()
+            or self.strip_level != self.requested_strip_level
+            or bool(self.patch_directory)
+        )
+
+
+def _patch_sha256(patch_path: Path) -> str:
+    return _hash_file_for_patch_state(patch_path)
+
+
+def _patch_receipt_dir() -> Path:
+    return get_config_path().parent / "patch_receipts"
+
+
+def _patch_receipt_path(*, requested_root: Path, patch_sha256: str, engine: str) -> Path:
+    identity = f"{requested_root.resolve()}|{patch_sha256}|{engine}".encode("utf-8", errors="surrogatepass")
+    key = hashlib.sha256(identity).hexdigest()
+    return _patch_receipt_dir() / f"{key}.json"
+
+
+def _snapshot_resolved_mapping_state(mapping: tuple[PatchTargetMapping, ...]) -> dict[str, dict[str, object]]:
+    state: dict[str, dict[str, object]] = {}
+    for item in mapping:
+        path = item.target_path
+        try:
+            if path.is_file():
+                stat = path.stat()
+                state[item.rel_path] = {
+                    "kind": "file",
+                    "size": int(stat.st_size),
+                    "sha256": _hash_file_for_patch_state(path),
+                }
+            elif path.exists():
+                state[item.rel_path] = {"kind": "other", "size": 0, "sha256": ""}
+            else:
+                state[item.rel_path] = {"kind": "missing", "size": 0, "sha256": ""}
+        except OSError as exc:
+            state[item.rel_path] = {"kind": "error", "size": 0, "sha256": str(exc)}
+    return state
+
+
+def _snapshot_patch_resolution_state(
+    *,
+    root: Path,
+    patch_path: Path,
+    strip_level: int,
+    patch_directory: str | None,
+    containment_root: Path,
+) -> dict[str, dict[str, object]]:
+    root_resolved = root.resolve()
+    containment_resolved = containment_root.resolve()
+    rel_paths = _collect_patch_preview_rel_paths(patch_path, strip_level, patch_directory)
+    state: dict[str, dict[str, object]] = {}
+    for rel in rel_paths:
+        path = _patch_rel_path(root_resolved, rel).resolve(strict=False)
+        try:
+            path.relative_to(root_resolved)
+            path.relative_to(containment_resolved)
+        except ValueError as exc:
+            raise ValueError(f"patch state path escapes selected target: {rel} -> {path}") from exc
+        try:
+            if path.is_file():
+                stat = path.stat()
+                state[rel] = {
+                    "kind": "file",
+                    "size": int(stat.st_size),
+                    "sha256": _hash_file_for_patch_state(path),
+                }
+            elif path.exists():
+                state[rel] = {"kind": "other", "size": 0, "sha256": ""}
+            else:
+                state[rel] = {"kind": "missing", "size": 0, "sha256": ""}
+        except OSError as exc:
+            state[rel] = {"kind": "error", "size": 0, "sha256": str(exc)}
+    return state
+
+
+def _save_patch_apply_receipt(
+    resolution: PatchOperationResolution,
+    *,
+    pre_state: dict[str, dict[str, object]],
+    post_state: dict[str, dict[str, object]],
+) -> Path:
+    receipt_path = _patch_receipt_path(
+        requested_root=resolution.requested_root,
+        patch_sha256=resolution.patch_sha256,
+        engine=resolution.engine,
+    )
+    ensure_parent_dir(receipt_path)
+    payload = {
+        "version": 1,
+        "apply_id": hashlib.sha256(
+            f"{datetime.now().isoformat()}|{resolution.patch_sha256}|{resolution.requested_root}".encode("utf-8")
+        ).hexdigest()[:20],
+        "applied_at": datetime.now().isoformat(timespec="seconds"),
+        "patch_sha256": resolution.patch_sha256,
+        "engine": resolution.engine,
+        "requested_target": str(resolution.requested_root),
+        "requested_strip": resolution.requested_strip_level,
+        "resolved_cwd": str(resolution.root),
+        "resolved_directory": resolution.patch_directory,
+        "resolved_strip": resolution.strip_level,
+        "mapping": [
+            {
+                "patch_path": item.raw_path,
+                "action": item.action,
+                "relative_target": item.rel_path,
+                "absolute_target": str(item.target_path),
+            }
+            for item in resolution.mapping
+        ],
+        "pre_state": pre_state,
+        "post_state": post_state,
+    }
+    receipt_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return receipt_path
+
+
+def _load_patch_apply_receipt(*, requested_root: Path, patch_sha256: str, engine: str) -> tuple[Path, dict[str, object]]:
+    receipt_path = _patch_receipt_path(
+        requested_root=requested_root,
+        patch_sha256=patch_sha256,
+        engine=engine,
+    )
+    if not receipt_path.is_file():
+        raise FileNotFoundError(
+            "No forward Apply receipt exists for this patch/target/engine. "
+            "Reverse with Auto-detect is intentionally disabled without the original resolution. "
+            "Turn Auto-detect OFF only if you know the exact cwd and -p mapping."
+        )
+    data = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or int(data.get("version", 0)) != 1:
+        raise ValueError(f"Unsupported or invalid patch receipt: {receipt_path}")
+    return receipt_path, data
+
+
+def _resolution_from_receipt(
+    *,
+    patch_path: Path,
+    requested_root: Path,
+    requested_strip_level: int,
+    engine: str,
+) -> tuple[PatchOperationResolution, Path, dict[str, object]]:
+    patch_digest = _patch_sha256(patch_path)
+    receipt_path, receipt = _load_patch_apply_receipt(
+        requested_root=requested_root,
+        patch_sha256=patch_digest,
+        engine=engine,
+    )
+    root = Path(str(receipt["resolved_cwd"])).resolve()
+    strip_level = int(receipt["resolved_strip"])
+    patch_directory_value = receipt.get("resolved_directory")
+    patch_directory = _normalize_patch_directory(str(patch_directory_value)) if patch_directory_value else None
+    mapping = resolve_patch_target_mapping(
+        root=root,
+        patch_path=patch_path,
+        strip_level=strip_level,
+        reverse=True,
+        patch_directory=patch_directory,
+        containment_root=requested_root,
+    )
+    expected_rel = [str(item.get("relative_target", "")) for item in receipt.get("mapping", []) if isinstance(item, dict)]
+    actual_rel = [item.rel_path for item in mapping]
+    if expected_rel != actual_rel:
+        raise RuntimeError(
+            "Patch receipt mapping no longer matches this patch. Automatic Reverse refused."
+        )
+    expected_post = receipt.get("post_state")
+    current_state = _snapshot_patch_resolution_state(
+        root=root,
+        patch_path=patch_path,
+        strip_level=strip_level,
+        patch_directory=patch_directory,
+        containment_root=requested_root,
+    )
+    if expected_post != current_state:
+        raise RuntimeError(
+            "Current filesystem does not match the recorded post-Apply state. "
+            "Automatic Reverse refused to avoid reversing a drifted tree."
+        )
+    return (
+        PatchOperationResolution(
+            engine=engine,
+            patch_path=patch_path,
+            patch_sha256=patch_digest,
+            requested_root=requested_root,
+            requested_strip_level=requested_strip_level,
+            reverse=True,
+            auto_detect=True,
+            root=root,
+            strip_level=strip_level,
+            patch_directory=patch_directory,
+            mapping=mapping,
+            attempts=(f"RECEIPT {receipt_path}: reused forward resolution",),
+        ),
+        receipt_path,
+        receipt,
+    )
 
 
 def dumpit_patch_plan_to_diff(plan: DumpItPatchPlan) -> DumpDiffResult:
@@ -3168,6 +3650,9 @@ class DumpItApp(tk.Tk):
         self._apply_patch_status_text = "No patch checked."
         self._apply_patch_log_key = ""
         self._apply_patch_log_lines: list[str] = []
+        self._apply_patch_resolution: PatchOperationResolution | None = None
+        self._apply_patch_reverse_receipt_path: Path | None = None
+        self._apply_patch_reverse_receipt: dict[str, object] | None = None
 
         self._build_ui()
         self._apply_non_ttk_widget_theme()
@@ -3497,6 +3982,9 @@ class DumpItApp(tk.Tk):
         self._apply_patch_log_lines = []
 
     def _on_apply_patch_selection_changed(self) -> None:
+        self._apply_patch_resolution = None
+        self._apply_patch_reverse_receipt_path = None
+        self._apply_patch_reverse_receipt = None
         self._refresh_apply_patch_target()
         self._reset_apply_patch_operation_log()
         self._set_apply_patch_status("No patch checked.")
@@ -4260,7 +4748,7 @@ class DumpItApp(tk.Tk):
 
     # ---------- Apply Patch UI / Runner ----------
     def _build_apply_patch_tab(self, parent: ttk.Frame, pad: dict) -> None:
-        info = ttk.LabelFrame(parent, text="Apply patch — v6")
+        info = ttk.LabelFrame(parent, text="Apply patch — v7")
         info.pack(fill="both", expand=True, **pad)
 
         desc = ttk.Label(
@@ -4270,6 +4758,8 @@ class DumpItApp(tk.Tk):
                 "This tab does not use Batch selection. Engine can be Git apply or DumpIt apply. "
                 "DumpIt apply is textual and transactional: failed hunks write nothing. "
                 "Preview opens a visual before/after diff without touching the target. "
+                "Auto-detect resolves once and the same mapping is reused by Preview/Dry run/Apply. "
+                "Reverse auto-detect reuses the recorded forward Apply receipt. "
                 "Results are written to the shared log below."
             ),
             wraplength=800,
@@ -4306,10 +4796,10 @@ class DumpItApp(tk.Tk):
         ttk.Label(opt_grid, text="Strip (-p)").grid(row=1, column=0, sticky="w", padx=3, pady=1)
         ttk.Entry(opt_grid, textvariable=self.patch_strip_level, width=7).grid(row=1, column=1, sticky="w", padx=3, pady=1)
         ttk.Checkbutton(opt_grid, text="Reverse (-R)", variable=self.patch_reverse).grid(row=1, column=2, sticky="w", padx=4, pady=1)
-        ttk.Checkbutton(opt_grid, text="Auto-detect target/-p", variable=self.patch_auto_detect).grid(row=2, column=0, columnspan=3, sticky="w", padx=3, pady=1)
+        ttk.Checkbutton(opt_grid, text="Auto-detect target/-p (Reverse uses receipt)", variable=self.patch_auto_detect).grid(row=2, column=0, columnspan=3, sticky="w", padx=3, pady=1)
         ttk.Checkbutton(opt_grid, text="Backup touched files", variable=self.patch_backup).grid(row=3, column=0, columnspan=3, sticky="w", padx=3, pady=1)
 
-        target_status = ttk.LabelFrame(info, text="Resolved target")
+        target_status = ttk.LabelFrame(info, text="Requested / resolved mapping")
         target_status.pack(fill="x", padx=4, pady=3)
         target_row = ttk.Frame(target_status)
         target_row.pack(fill="x", padx=4, pady=3)
@@ -4449,63 +4939,173 @@ class DumpItApp(tk.Tk):
         for error in plan.parse_errors:
             self._append_apply_patch_log(f"{prefix} ERROR {error}")
 
-    def _resolve_patch_apply_plan_for_current_ui(self) -> tuple[Path, Path, int, str | None, tuple[str, ...]]:
-        patch_path, strip_level = self._get_patch_path_and_strip_level()
-        target = self._get_patch_target_dir()
-        reverse = self.patch_reverse.get()
-
-        if self.patch_auto_detect.get():
-            plan = detect_git_apply_plan(
-                profile_root=target,
-                patch_path=patch_path,
-                preferred_strip_level=strip_level,
-                reverse=reverse,
-            )
-            return patch_path, plan.root, plan.strip_level, plan.patch_directory, plan.attempts
-
-        check_ok, check_output = run_git_apply_patch(
-            root=target,
-            patch_path=patch_path,
-            strip_level=strip_level,
-            reverse=reverse,
-            check_only=True,
+    def _resolution_matches_current_ui(self, resolution: PatchOperationResolution) -> bool:
+        try:
+            patch_path, strip_level = self._get_patch_path_and_strip_level()
+            target = self._get_patch_target_dir()
+        except Exception:
+            return False
+        if resolution.engine != self._normalize_patch_engine():
+            return False
+        if resolution.patch_path != patch_path or resolution.patch_sha256 != _patch_sha256(patch_path):
+            return False
+        return (
+            resolution.requested_root == target
+            and resolution.requested_strip_level == strip_level
+            and resolution.reverse == bool(self.patch_reverse.get())
+            and resolution.auto_detect == bool(self.patch_auto_detect.get())
         )
-        if not check_ok:
-            raise RuntimeError(check_output)
-        return patch_path, target, strip_level, None, ()
 
-    def _resolve_dumpit_patch_plan_for_current_ui(self) -> DumpItPatchApplyPlan:
-        patch_path, strip_level = self._get_patch_path_and_strip_level()
-        target = self._get_patch_target_dir()
-        reverse = self.patch_reverse.get()
-
-        if self.patch_auto_detect.get():
-            return detect_dumpit_apply_plan(
-                profile_root=target,
-                patch_path=patch_path,
-                preferred_strip_level=strip_level,
-                reverse=reverse,
-            )
-
-        plan = build_dumpit_patch_plan(
-            root=target,
-            patch_path=patch_path,
-            strip_level=strip_level,
-            reverse=reverse,
-            patch_directory=None,
+    def _show_patch_resolution(self, resolution: PatchOperationResolution) -> None:
+        requested = f"Requested: target={resolution.requested_root}, -p{resolution.requested_strip_level}"
+        resolved = (
+            f"Resolved: cwd={resolution.root}, "
+            f"{('--directory=' + resolution.patch_directory + ', ') if resolution.patch_directory else ''}"
+            f"-p{resolution.strip_level}"
         )
-        if plan.failed:
+        warning = "\nAUTO-DETECT OVERRIDE: resolved mapping differs from requested values." if resolution.differs_from_requested else ""
+        self.lbl_apply_patch_target.configure(
+            text=f"{requested}\n{resolved}\nPatch SHA256: {resolution.patch_sha256}{warning}"
+        )
+
+    def _append_patch_resolution_log(self, resolution: PatchOperationResolution, *, prefix: str) -> None:
+        self._append_apply_patch_log(f"{prefix} patch_sha256={resolution.patch_sha256}")
+        self._append_apply_patch_log(
+            f"{prefix} Requested: target={resolution.requested_root}, -p{resolution.requested_strip_level}"
+        )
+        self._append_apply_patch_log(
+            f"{prefix} Resolved: cwd={resolution.root}"
+            f"{(' --directory=' + resolution.patch_directory) if resolution.patch_directory else ''}, "
+            f"-p{resolution.strip_level}"
+        )
+        if resolution.differs_from_requested:
+            self._append_apply_patch_log(f"{prefix} WARNING resolved mapping differs from requested values")
+        for line in _format_patch_mapping(resolution.mapping):
+            self._append_apply_patch_log(f"{prefix} MAP {line}")
+        for attempt in resolution.attempts:
+            self._append_apply_patch_log(f"{prefix} {attempt}")
+
+    def _revalidate_patch_resolution(self, resolution: PatchOperationResolution) -> None:
+        current_mapping = resolve_patch_target_mapping(
+            root=resolution.root,
+            patch_path=resolution.patch_path,
+            strip_level=resolution.strip_level,
+            reverse=resolution.reverse,
+            patch_directory=resolution.patch_directory,
+            containment_root=resolution.requested_root,
+        )
+        if current_mapping != resolution.mapping:
             raise RuntimeError(
-                "DumpIt apply plan failed. "
-                f"{_dumpit_patch_plan_failure_detail(plan, 8)}"
+                "Resolved patch mapping changed after resolution. Operation refused; run Preview again."
             )
-        return DumpItPatchApplyPlan(
-            root=target,
-            strip_level=strip_level,
-            patch_directory=None,
-            plan=plan,
-            attempts=(),
-        )
+
+    def _resolve_patch_operation_for_current_ui(self) -> PatchOperationResolution:
+        cached = self._apply_patch_resolution
+        if cached is not None and self._resolution_matches_current_ui(cached):
+            self._show_patch_resolution(cached)
+            return cached
+
+        patch_path, strip_level = self._get_patch_path_and_strip_level()
+        target = self._get_patch_target_dir()
+        reverse = bool(self.patch_reverse.get())
+        auto_detect = bool(self.patch_auto_detect.get())
+        engine = self._normalize_patch_engine()
+        patch_digest = _patch_sha256(patch_path)
+        self._apply_patch_reverse_receipt_path = None
+        self._apply_patch_reverse_receipt = None
+
+        if reverse and auto_detect:
+            resolution, receipt_path, receipt = _resolution_from_receipt(
+                patch_path=patch_path,
+                requested_root=target,
+                requested_strip_level=strip_level,
+                engine=engine,
+            )
+            self._apply_patch_reverse_receipt_path = receipt_path
+            self._apply_patch_reverse_receipt = receipt
+        elif engine == "dumpit":
+            if auto_detect:
+                detected = detect_dumpit_apply_plan(
+                    profile_root=target,
+                    patch_path=patch_path,
+                    preferred_strip_level=strip_level,
+                    reverse=reverse,
+                )
+                root = detected.root
+                effective_strip = detected.strip_level
+                patch_directory = detected.patch_directory
+                attempts = detected.attempts
+            else:
+                root = target
+                effective_strip = strip_level
+                patch_directory = None
+                plan = build_dumpit_patch_plan(
+                    root=root,
+                    patch_path=patch_path,
+                    strip_level=effective_strip,
+                    reverse=reverse,
+                    patch_directory=patch_directory,
+                )
+                if plan.failed:
+                    raise RuntimeError(
+                        "DumpIt apply plan failed. "
+                        f"{_dumpit_patch_plan_failure_detail(plan, 8)}"
+                    )
+                attempts = ()
+            mapping = resolve_patch_target_mapping(
+                root=root,
+                patch_path=patch_path,
+                strip_level=effective_strip,
+                reverse=reverse,
+                patch_directory=patch_directory,
+                containment_root=target,
+            )
+            resolution = PatchOperationResolution(
+                engine=engine, patch_path=patch_path, patch_sha256=patch_digest,
+                requested_root=target, requested_strip_level=strip_level,
+                reverse=reverse, auto_detect=auto_detect, root=root,
+                strip_level=effective_strip, patch_directory=patch_directory,
+                mapping=mapping, attempts=tuple(attempts),
+            )
+        else:
+            if auto_detect:
+                detected = detect_git_apply_plan(
+                    profile_root=target,
+                    patch_path=patch_path,
+                    preferred_strip_level=strip_level,
+                    reverse=reverse,
+                )
+                root = detected.root
+                effective_strip = detected.strip_level
+                patch_directory = detected.patch_directory
+                attempts = detected.attempts
+            else:
+                root = target
+                effective_strip = strip_level
+                patch_directory = None
+                check_ok, check_output = run_git_apply_patch(
+                    root=root, patch_path=patch_path, strip_level=effective_strip,
+                    reverse=reverse, check_only=True, patch_directory=patch_directory,
+                )
+                if not check_ok:
+                    raise RuntimeError(check_output)
+                attempts = ()
+            mapping = resolve_patch_target_mapping(
+                root=root, patch_path=patch_path, strip_level=effective_strip,
+                reverse=reverse, patch_directory=patch_directory,
+                containment_root=target,
+            )
+            resolution = PatchOperationResolution(
+                engine=engine, patch_path=patch_path, patch_sha256=patch_digest,
+                requested_root=target, requested_strip_level=strip_level,
+                reverse=reverse, auto_detect=auto_detect, root=root,
+                strip_level=effective_strip, patch_directory=patch_directory,
+                mapping=mapping, attempts=tuple(attempts),
+            )
+
+        self._apply_patch_resolution = resolution
+        self._show_patch_resolution(resolution)
+        return resolution
 
     def _open_delta_html_result(self, diff: DumpDiffResult, *, log_label: str) -> Path:
         self._cleanup_diff_temp_html(log=True)
@@ -4533,65 +5133,43 @@ class DumpItApp(tk.Tk):
     def _preview_patch_changes(self) -> None:
         self._refresh_apply_patch_target()
         self._begin_apply_patch_operation_log("preview")
-        engine = self._normalize_patch_engine()
         try:
-            if engine == "dumpit":
-                resolved = self._resolve_dumpit_patch_plan_for_current_ui()
-                plan = resolved.plan
-                self._append_apply_patch_log(
-                    f"DumpIt patch preview started: {plan.patch_path} -> target={resolved.root}, "
-                    f"{('--directory=' + resolved.patch_directory + ', ') if resolved.patch_directory else ''}"
-                    f"-p{resolved.strip_level}, reverse={plan.reverse}"
-                )
-                for attempt in resolved.attempts:
-                    self._append_apply_patch_log(f"[DumpIt Apply Preview]   {attempt}")
-                self._append_dumpit_patch_plan_log(plan, prefix="[DumpIt Apply Preview]")
+            resolution = self._resolve_patch_operation_for_current_ui()
+            self._append_patch_resolution_log(resolution, prefix="[Patch Preview]")
+            self._revalidate_patch_resolution(resolution)
 
+            if resolution.engine == "dumpit":
+                plan = build_dumpit_patch_plan(
+                    root=resolution.root,
+                    patch_path=resolution.patch_path,
+                    strip_level=resolution.strip_level,
+                    reverse=resolution.reverse,
+                    patch_directory=resolution.patch_directory,
+                )
+                self._append_dumpit_patch_plan_log(plan, prefix="[DumpIt Apply Preview]")
                 if plan.failed:
                     raise RuntimeError(
                         "DumpIt apply preview failed. "
                         f"{_dumpit_patch_plan_failure_detail(plan, 8)}"
                     )
-
                 diff = dumpit_patch_plan_to_diff(plan)
-                out_path = self._open_delta_html_result(diff, log_label="DumpIt patch preview")
-                status = (
-                    f"DumpIt patch preview opened. cwd={resolved.root}, "
-                    f"{('--directory=' + resolved.patch_directory + ', ') if resolved.patch_directory else ''}"
-                    f"-p{resolved.strip_level}. {plan.status_summary()}. "
-                    f"HTML: {out_path}"
+                label = "DumpIt patch preview"
+            else:
+                diff = build_patch_preview_diff(
+                    root=resolution.root,
+                    patch_path=resolution.patch_path,
+                    strip_level=resolution.strip_level,
+                    reverse=resolution.reverse,
+                    patch_directory=resolution.patch_directory,
                 )
-                self._set_apply_patch_status(status)
-                self._append_apply_patch_log(status)
-                return
+                label = "Git patch preview"
 
-            patch_path, effective_root, effective_strip, patch_directory, attempts = self._resolve_patch_apply_plan_for_current_ui()
-            reverse = self.patch_reverse.get()
-
-            self._append_apply_patch_log(
-                f"Git patch preview started: {patch_path} -> target={effective_root}, "
-                f"{('--directory=' + patch_directory + ', ') if patch_directory else ''}"
-                f"-p{effective_strip}, reverse={reverse}"
-            )
-            for attempt in attempts:
-                self._append_apply_patch_log(f"[Git Apply Preview]   {attempt}")
-
-            diff = build_patch_preview_diff(
-                root=effective_root,
-                patch_path=patch_path,
-                strip_level=effective_strip,
-                reverse=reverse,
-                patch_directory=patch_directory,
-            )
-
-            out_path = self._open_delta_html_result(diff, log_label="Git patch preview")
+            out_path = self._open_delta_html_result(diff, log_label=label)
             status = (
-                f"Git patch preview opened. cwd={effective_root}, "
-                f"{('--directory=' + patch_directory + ', ') if patch_directory else ''}"
-                f"-p{effective_strip}. "
-                f"Added {len(diff.added)}, removed {len(diff.removed)}, "
-                f"modified {len(diff.modified)}, unchanged {len(diff.unchanged)}. "
-                f"HTML: {out_path}"
+                f"{label} opened. cwd={resolution.root}, "
+                f"{('--directory=' + resolution.patch_directory + ', ') if resolution.patch_directory else ''}"
+                f"-p{resolution.strip_level}. Added {len(diff.added)}, removed {len(diff.removed)}, "
+                f"modified {len(diff.modified)}, unchanged {len(diff.unchanged)}. HTML: {out_path}"
             )
             self._set_apply_patch_status(status)
             self._append_apply_patch_log(status)
@@ -4604,11 +5182,11 @@ class DumpItApp(tk.Tk):
     def _apply_patch_to_target(self, dry_run: bool) -> None:
         self._refresh_apply_patch_target()
         action = "dry-run" if dry_run else "apply"
-        engine = self._normalize_patch_engine()
         self._begin_apply_patch_operation_log(action)
         try:
-            patch_path, strip_level = self._get_patch_path_and_strip_level()
-            target = self._get_patch_target_dir()
+            resolution = self._resolve_patch_operation_for_current_ui()
+            self._append_patch_resolution_log(resolution, prefix="[Patch Apply]")
+            self._revalidate_patch_resolution(resolution)
         except Exception as e:
             status = f"Patch {action} failed. ERROR: {e}"
             self._set_apply_patch_status(status)
@@ -4617,125 +5195,118 @@ class DumpItApp(tk.Tk):
             return
 
         if not dry_run:
+            override = "\n\nWARNING: auto-detect changed the requested mapping." if resolution.differs_from_requested else ""
             if not messagebox.askyesno(
                 "Apply Patch",
-                f"Apply patch with {self._get_patch_engine_label()} to this target folder?\n\nTarget: {target}\n\nPatch: {patch_path}",
+                f"Apply patch with {self._get_patch_engine_label()}?\n\n"
+                f"Requested target: {resolution.requested_root}\n"
+                f"Requested strip: -p{resolution.requested_strip_level}\n\n"
+                f"Resolved cwd: {resolution.root}\n"
+                f"Resolved directory: {resolution.patch_directory or '—'}\n"
+                f"Resolved strip: -p{resolution.strip_level}\n\n"
+                f"Patch: {resolution.patch_path}{override}",
             ):
                 self._append_apply_patch_log("Patch apply cancelled by user.")
                 return
 
-        reverse = self.patch_reverse.get()
-        auto_detect = self.patch_auto_detect.get()
-        self._append_apply_patch_log(
-            f"Patch {action} started: {patch_path} -> target={target}, "
-            f"preferred -p{strip_level}, reverse={reverse}, auto_detect={auto_detect}, engine={self._get_patch_engine_label()}"
-        )
+        pre_state: dict[str, dict[str, object]] | None = None
+        if not dry_run:
+            pre_state = _snapshot_patch_resolution_state(
+                root=resolution.root,
+                patch_path=resolution.patch_path,
+                strip_level=resolution.strip_level,
+                patch_directory=resolution.patch_directory,
+                containment_root=resolution.requested_root,
+            )
 
         try:
-            if engine == "dumpit":
-                resolved = self._resolve_dumpit_patch_plan_for_current_ui()
-                plan = resolved.plan
-                self._append_apply_patch_log(
-                    f"[DumpIt Apply] Plan: cwd={resolved.root}"
-                    f"{(' --directory=' + resolved.patch_directory) if resolved.patch_directory else ''}, -p{resolved.strip_level}"
+            backup_text = ""
+            receipt_text = ""
+            if resolution.engine == "dumpit":
+                plan = build_dumpit_patch_plan(
+                    root=resolution.root,
+                    patch_path=resolution.patch_path,
+                    strip_level=resolution.strip_level,
+                    reverse=resolution.reverse,
+                    patch_directory=resolution.patch_directory,
                 )
-                for attempt in resolved.attempts:
-                    self._append_apply_patch_log(f"[DumpIt Apply]   {attempt}")
                 self._append_dumpit_patch_plan_log(plan, prefix="[DumpIt Apply]")
-
                 if plan.failed:
                     raise RuntimeError(
                         "DumpIt apply is transactional: no files were written. "
                         f"{_dumpit_patch_plan_failure_detail(plan, 8)}"
                     )
 
-                backup_text = ""
                 if not dry_run and self.patch_backup.get():
                     backup_dir, backed_up = create_patch_backup(
-                        resolved.root,
-                        patch_path,
-                        resolved.strip_level,
-                        resolved.patch_directory,
+                        resolution.root, resolution.patch_path, resolution.strip_level, resolution.patch_directory
                     )
-                    if backup_dir:
-                        backup_text = f" backup={backup_dir} ({backed_up} file(s))"
-                    else:
-                        backup_text = " backup=none"
+                    backup_text = f" backup={backup_dir} ({backed_up} file(s))" if backup_dir else " backup=none"
 
                 written = 0
                 deleted = 0
                 if not dry_run:
                     written, deleted = execute_dumpit_patch_plan(plan)
-
-                status = (
-                    f"Patch {action} completed. OK. engine=DumpIt apply, cwd={resolved.root}, "
-                    f"{('--directory=' + resolved.patch_directory + ', ') if resolved.patch_directory else ''}"
-                    f"-p{resolved.strip_level}, {plan.status_summary()}, written={written}, deleted={deleted}{backup_text}"
-                )
-                self._set_apply_patch_status(status)
-                self._append_apply_patch_log(status)
-                messagebox.showinfo("Apply Patch", status)
-                return
-
-            if auto_detect:
-                git_plan = detect_git_apply_plan(
-                    profile_root=target,
-                    patch_path=patch_path,
-                    preferred_strip_level=strip_level,
-                    reverse=reverse,
-                )
-                effective_root = git_plan.root
-                effective_strip = git_plan.strip_level
-                patch_directory = git_plan.patch_directory
-                self._append_apply_patch_log(
-                    f"[Git Apply] Plan: cwd={effective_root}"
-                    f"{(' --directory=' + patch_directory) if patch_directory else ''}, -p{effective_strip}"
-                )
-                for attempt in git_plan.attempts:
-                    self._append_apply_patch_log(f"[Git Apply]   {attempt}")
+                detail_text = f", {plan.status_summary()}, written={written}, deleted={deleted}"
             else:
-                effective_root = target
-                effective_strip = strip_level
-                patch_directory = None
+                # Re-check the exact cached resolution. No auto-detect is repeated here.
                 check_ok, check_output = run_git_apply_patch(
-                    root=effective_root,
-                    patch_path=patch_path,
-                    strip_level=effective_strip,
-                    reverse=reverse,
-                    check_only=True,
+                    root=resolution.root, patch_path=resolution.patch_path,
+                    strip_level=resolution.strip_level, reverse=resolution.reverse,
+                    check_only=True, patch_directory=resolution.patch_directory,
                 )
                 if not check_ok:
                     raise RuntimeError(check_output)
 
-            backup_text = ""
-            if not dry_run and self.patch_backup.get():
-                backup_dir, backed_up = create_patch_backup(
-                    effective_root,
-                    patch_path,
-                    effective_strip,
-                    patch_directory,
-                )
-                if backup_dir:
-                    backup_text = f" backup={backup_dir} ({backed_up} file(s))"
-                else:
-                    backup_text = " backup=none"
+                if not dry_run and self.patch_backup.get():
+                    backup_dir, backed_up = create_patch_backup(
+                        resolution.root, resolution.patch_path, resolution.strip_level, resolution.patch_directory
+                    )
+                    backup_text = f" backup={backup_dir} ({backed_up} file(s))" if backup_dir else " backup=none"
+
+                if not dry_run:
+                    apply_ok, apply_output = run_git_apply_patch(
+                        root=resolution.root, patch_path=resolution.patch_path,
+                        strip_level=resolution.strip_level, reverse=resolution.reverse,
+                        check_only=False, patch_directory=resolution.patch_directory,
+                    )
+                    if not apply_ok:
+                        raise RuntimeError(apply_output)
+                detail_text = ""
 
             if not dry_run:
-                apply_ok, apply_output = run_git_apply_patch(
-                    root=effective_root,
-                    patch_path=patch_path,
-                    strip_level=effective_strip,
-                    reverse=reverse,
-                    check_only=False,
-                    patch_directory=patch_directory,
+                post_state = _snapshot_patch_resolution_state(
+                    root=resolution.root,
+                    patch_path=resolution.patch_path,
+                    strip_level=resolution.strip_level,
+                    patch_directory=resolution.patch_directory,
+                    containment_root=resolution.requested_root,
                 )
-                if not apply_ok:
-                    raise RuntimeError(apply_output)
+                if resolution.reverse:
+                    receipt = self._apply_patch_reverse_receipt or {}
+                    expected_pre = receipt.get("pre_state")
+                    if expected_pre is not None and post_state != expected_pre:
+                        raise RuntimeError(
+                            "Reverse completed, but the filesystem does not match the recorded pre-Apply state. "
+                            "Receipt retained for diagnosis."
+                        )
+                    receipt_path = self._apply_patch_reverse_receipt_path
+                    if receipt_path and receipt_path.exists():
+                        receipt_path.unlink()
+                        receipt_text = f" receipt_consumed={receipt_path}"
+                else:
+                    try:
+                        receipt_path = _save_patch_apply_receipt(
+                            resolution, pre_state=pre_state or {}, post_state=post_state
+                        )
+                        receipt_text = f" receipt={receipt_path}"
+                    except Exception as exc:
+                        receipt_text = f" receipt_warning={exc}"
 
             status = (
-                f"Patch {action} completed. OK. engine=Git apply, cwd={effective_root}, "
-                f"{('--directory=' + patch_directory + ', ') if patch_directory else ''}"
-                f"-p{effective_strip}{backup_text}"
+                f"Patch {action} completed. OK. engine={self._get_patch_engine_label()}, cwd={resolution.root}, "
+                f"{('--directory=' + resolution.patch_directory + ', ') if resolution.patch_directory else ''}"
+                f"-p{resolution.strip_level}{detail_text}{backup_text}{receipt_text}"
             )
             self._set_apply_patch_status(status)
             self._append_apply_patch_log(status)
