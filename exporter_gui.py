@@ -2566,6 +2566,23 @@ class ExportFileEntry:
     text: str
     line_count: int
     modified_at: str
+    stable_id: str = ""
+    extension: str = ""
+    byte_count: int = 0
+    content_sha256: str = ""
+
+
+def build_export_file_stable_id(rel_path: str) -> str:
+    normalized = str(rel_path or "").replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"F-{digest}"
+
+
+def build_export_text_metadata(text: str) -> tuple[int, str]:
+    payload = text.encode("utf-8")
+    return len(payload), hashlib.sha256(payload).hexdigest()
 
 
 def format_file_mtime(p: Path) -> str:
@@ -2602,6 +2619,7 @@ def collect_export_entries(
 
         rel_path = rel_posix(root, p)
         header_path = str(p) if header_full_path else rel_path
+        byte_count, content_sha256 = build_export_text_metadata(text)
         entries.append(
             ExportFileEntry(
                 path=p,
@@ -2610,6 +2628,10 @@ def collect_export_entries(
                 text=text,
                 line_count=count_lines(text),
                 modified_at=format_file_mtime(p),
+                stable_id=build_export_file_stable_id(rel_path),
+                extension=p.suffix.lower(),
+                byte_count=byte_count,
+                content_sha256=content_sha256,
             )
         )
 
