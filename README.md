@@ -1,48 +1,52 @@
 # DumpIt — Complete Manual
 
-**Source baseline:** `DumpIT_2026-08-28_225051.txt`  
-**Dump baseline:** 2026-08-28 20:50:52 UTC  
-**Main application source:** `exporter_gui.py` — 6137 lines in the baseline  
-**Purpose:** operational and technical manual for the DumpIt application in the configuration represented by the specified baseline.
+**Original source baseline:** `DumpIT_2026-09-04_100252.txt`  
+**Included extensions:** patches `LLM0` → `LLM5` + `_LLM` output naming patch  
+**Manual revision:** 2026-09-05  
+**Main application source:** `exporter_gui.py` — 6338 lines in the reconstructed baseline after the LLM patches  
+**Purpose:** complete operational and technical manual for the current state of the DumpIt application, including the `llm` export mode.
 
 ---
 
 # 1. What DumpIt Is
 
-DumpIt is a Tkinter desktop application for working with text snapshots of software projects.
+DumpIt is a Tkinter desktop application for working with textual snapshots of software projects.
 
 Its main functions are:
 
 ```text
 Export
-    creates a text dump of a project
+    creates a textual dump of a project
+    in standard or llm format
 
 Import
     reconstructs files from a DumpIt dump
 
 Watch
-    monitors a project and automatically reruns export
+    monitors a project and automatically runs export again
 
 Batch
     runs Preview or Export across multiple profiles
 
 Diff
-    compares two dumps and generates a visual, text, or .patch delta
+    compares two dumps and generates a visual, textual, or .patch delta
 
 Apply Patch
     validates, previews, applies, and reverses unified-diff patches
-    through either the DumpIt engine or Git
+    through the DumpIt or Git engine
 ```
 
 DumpIt uses **persistent profiles** to associate each project with its own settings.
 
-The interface contains a global profile bar, six functional tabs, and one shared log.
+The interface contains a global profile bar, six functional tabs, and a shared log.
+
+The `llm` mode does not compress or rewrite source. It adds deterministic metadata and a structural index around the textual content, which remains the authoritative payload of the dump.
 
 ---
 
 # 2. Startup and Build
 
-## 2.1 Running from Source
+## 2.1 Running from source
 
 The entry point is:
 
@@ -66,7 +70,7 @@ On Ubuntu the pipeline installs:
 sudo apt-get install -y tk tcl tk-dev tcl-dev
 ```
 
-## 2.2 Building the Executable
+## 2.2 Executable build
 
 The current pipeline uses PyInstaller:
 
@@ -83,7 +87,7 @@ dist/DumpIt...
 
 The workflow produces artifacts for both Windows and Ubuntu.
 
-## 2.3 Initial Directory
+## 2.3 Initial directory
 
 When DumpIt runs as a PyInstaller executable:
 
@@ -127,7 +131,7 @@ Initial minimum size:
 
 The UI automatically detects the operating-system light/dark theme on a best-effort basis.
 
-The baseline does not provide a manual theme selector.
+There is no manual theme selector in the baseline.
 
 ---
 
@@ -147,9 +151,9 @@ Save
 Reset
 ```
 
-## 4.1 What a Profile Contains
+## 4.1 What a profile contains
 
-Per-profile persisted settings include:
+Persisted settings for each profile include:
 
 ```text
 project_dir
@@ -161,6 +165,7 @@ add_timestamp
 timestamp_keep_old
 skip_binary
 header_full_path
+export_format
 
 import_dump_file
 import_target_dir
@@ -201,7 +206,7 @@ Two profiles cannot be created with the same existing name.
 
 `Rename...` renames the current profile.
 
-The new name cannot already exist.
+The new name must not already exist.
 
 ## 4.4 Delete
 
@@ -217,8 +222,8 @@ After deletion, DumpIt selects another available profile.
 
 ```text
 writes the current UI values into the active profile
-saves the active profile
-saves the Batch selection
+stores the active profile
+stores the Batch selection
 writes dumpit.ini
 ```
 
@@ -226,7 +231,7 @@ writes dumpit.ini
 
 `Reset` restores default values **in the UI only**.
 
-It does not automatically persist the reset.
+It does not automatically save the reset.
 
 To make it persistent:
 
@@ -258,7 +263,7 @@ If `APPDATA` is unavailable:
 
 ## 5.2 macOS / Linux / Unix
 
-If the following variable is defined:
+If defined:
 
 ```text
 XDG_CONFIG_HOME
@@ -276,16 +281,27 @@ otherwise:
 ~/.config/DumpIt/dumpit.ini
 ```
 
-## 5.3 Legacy Config Compatibility
+## 5.3 Legacy config compatibility
 
-At startup DumpIt normalizes older configuration layouts:
+At startup, DumpIt normalizes older configurations:
 
 ```text
 App -> app
-duplicate profile: sections differing only by letter case -> merge
+duplicate profile: sections differing only by casing -> merge
 ```
 
-If a conflict occurs during the merge, the primary/canonical section keeps its own value.
+If a conflict occurs during merge, the primary/canonical section keeps its own value.
+
+For `export_format`, compatibility is conservative:
+
+```text
+missing key        -> standard
+standard value     -> standard
+llm value          -> llm
+unsupported value  -> standard while loading config
+```
+
+Internal APIs that explicitly receive an unsupported format instead use strict validation and raise an error.
 
 ---
 
@@ -314,6 +330,9 @@ Skip binary
 
 Full path header
     OFF
+
+Export format
+    standard
 
 Import overwrite
     ON
@@ -348,6 +367,8 @@ Patch engine
 
 Note: the Include list is only the **default**. A profile may include any other user-configured pattern, for example `*.py`, `*.js`, `*.css`, `*.yml`.
 
+`export_format=standard` preserves historical behavior. `export_format=llm` enables the indexed format described in the following sections.
+
 ---
 
 # 7. Export
@@ -364,10 +385,25 @@ Timestamp output
 Keep old
 Skip binary
 Full path header
+Export format: standard | llm
 
 Preview
 Export
 ```
+
+`Export format` is persisted in the profile.
+
+Semantics:
+
+```text
+standard
+    historical DumpIt format
+
+llm
+    lossless indexed format for LLM navigation and ingestion
+```
+
+The selected format changes rendering and, for `llm`, also changes the physical output name through the `_LLM` suffix.
 
 ---
 
@@ -379,9 +415,9 @@ Export
 
 The project must exist.
 
-The path is saved in the profile.
+The path is stored in the profile.
 
-When the root changes, DumpIt may update the output filename if the current one still matches a default output name.
+When the root changes, DumpIt may update the output name if the current one still corresponds to a default output.
 
 ---
 
@@ -401,7 +437,7 @@ Rules:
 
 ```text
 pattern without / or \
-    -> match against filename
+    -> match against file name
 
 pattern with / or \
     -> match against path relative to root
@@ -420,7 +456,7 @@ tests/*.py
     include relative paths compatible with the pattern
 ```
 
-An abbreviated form such as:
+A shorthand form such as:
 
 ```text
 .py
@@ -432,7 +468,7 @@ is normalized to:
 *.py
 ```
 
-when it contains no wildcard or path separator.
+when it contains no wildcard or separator.
 
 ---
 
@@ -456,7 +492,7 @@ A file under:
 project/node_modules/package/file.js
 ```
 
-is excluded when `node_modules` is in the list.
+is excluded if `node_modules` is in the list.
 
 ---
 
@@ -476,17 +512,17 @@ If it finds a NUL byte:
 \x00
 ```
 
-the file is considered probably binary and is excluded.
+it considers the file probably binary and excludes it.
 
 If the sample cannot be read, the file is treated as binary for filtering purposes.
 
-This is not a complete MIME-recognition system; it is a practical safeguard for primarily text-based dumps.
+This is not a complete MIME-recognition system; it is a practical safeguard for primarily textual dumps.
 
 ---
 
 # 12. Reading Text Files
 
-For included files DumpIt attempts:
+For included files, DumpIt attempts:
 
 ```text
 UTF-8 with BOM / utf-8-sig
@@ -494,7 +530,7 @@ UTF-8
 UTF-8 with errors=replace as fallback
 ```
 
-Therefore a file that is not strictly UTF-8 may still be represented in the dump with replacement characters.
+Therefore, a file that is not strictly UTF-8 can still be represented in the dump with replacement characters.
 
 Read errors do not necessarily stop the entire export; they are counted as `skipped read errors`.
 
@@ -502,7 +538,7 @@ Read errors do not necessarily stop the entire export; they are counted as `skip
 
 # 13. Output File
 
-If not specified, the default output is:
+If not specified, the default base output is:
 
 ```text
 <project root>/<root name>.txt
@@ -516,33 +552,71 @@ H:\DEV\MY_PROJECT
 H:\DEV\MY_PROJECT\MY_PROJECT.txt
 ```
 
-DumpIt excludes the output itself from scanning to prevent self-inclusion.
+The path shown/stored in the profile represents the **base output**. The resolver then applies the selected format.
 
-When timestamping is enabled, it also excludes the associated family of timestamped exports.
+With `standard` format:
+
+```text
+MY_PROJECT.txt
+```
+
+With `llm` format:
+
+```text
+MY_PROJECT_LLM.txt
+```
+
+The `_LLM` suffix is automatically inserted before the extension. The operation is idempotent: a basename already ending in `_LLM` does not receive a second suffix.
+
+DumpIt excludes from the scan:
+
+```text
+current output
+current base output
+standard variant of the same basename
+_LLM variant of the same basename
+```
+
+With timestamps enabled, timestamped families of **both** variants are also excluded. This prevents an old dump of the other format from being included in a new dump when switching between Standard and LLM.
 
 ---
 
 # 14. Timestamp Output
 
-With `Timestamp output` enabled:
+With `Timestamp output` enabled, the timestamp is applied to the basename already resolved for the format.
+
+Standard:
 
 ```text
 name.txt
-```
-
-becomes:
-
-```text
+↓
 name_YYYY-MM-DD_HHMMSS.txt
 ```
 
-Example:
+LLM:
 
 ```text
-TradingTool_2026-08-28_225051.txt
+name.txt
+↓
+name_LLM_YYYY-MM-DD_HHMMSS.txt
 ```
 
-If the current filename already contains a DumpIt-format timestamp, the program first derives the base name and then applies the new timestamp.
+Examples:
+
+```text
+TradingTool_2026-09-05_113000.txt
+TradingTool_LLM_2026-09-05_113000.txt
+```
+
+If the current name already contains a DumpIt-format timestamp, the program first derives the base name and then applies the new timestamp.
+
+If a timestamped path is resolved in `llm` mode, `_LLM` is placed before the timestamp:
+
+```text
+DumpIt_2026-09-05_113000.txt
+↓
+DumpIt_LLM_2026-09-05_113000.txt
+```
 
 ---
 
@@ -570,37 +644,54 @@ Therefore:
 Keep old = 10
 ```
 
-results in keeping at most:
+keeps at most:
 
 ```text
 1 new + 10 previous
 ```
 
-for that output family.
+for the current output family.
 
-Older files are deleted after a successful timestamped export.
+Standard and LLM form separate families:
 
-Deletion errors are logged.
+```text
+Project_YYYY-...txt
+Project_LLM_YYYY-...txt
+```
+
+Retention executed during an export operates on the family of the file actually generated. Scan exclusion, however, considers both families to prevent cross-format self-inclusion.
+
+Older files are deleted after a successful timestamped export. Deletion errors are logged.
 
 ---
 
 # 16. Full Path Header
 
-With `Full path header` disabled, file sections use relative paths:
+With `Full path header` disabled, file sections use relative paths.
+
+Standard:
 
 ```text
 ===== FILE: src/module.py | lines=123 | modified=... =====
 ```
 
-With `Full path header` enabled:
+LLM:
 
 ```text
-===== FILE: H:\DEV\PROJECT\src\module.py | lines=123 | modified=... =====
+===== FILE: src/module.py | lines=123 | id=F-... | bytes=... | sha256=... | modified=... =====
 ```
 
-The `PROJECT TREE` remains based on relative paths.
+With `Full path header` enabled, the path in the `FILE` section becomes absolute:
 
-For Diff and Import it is normally simpler to keep the same mode across the dumps being compared.
+```text
+===== FILE: H:\DEV\PROJECT\src\module.py | ... =====
+```
+
+The `PROJECT TREE` always remains based on relative paths.
+
+In LLM format, the `FILE INDEX` also always remains based on relative paths, regardless of `Full path header`.
+
+For Diff and Import, it is normally simpler to keep the same `Full path header` mode consistent between compared dumps. Standard and LLM can still be compared if the `FILE` headers represent the same paths.
 
 ---
 
@@ -610,8 +701,10 @@ For Diff and Import it is normally simpler to keep the same mode across the dump
 
 ```text
 validates project folder
-calculates filters
-calculates excluded output
+computes filters
+normalizes Export format
+resolves the effective output name
+computes both output variants to exclude
 scans the project
 counts included files
 ```
@@ -622,9 +715,9 @@ The result is written to the log:
 Preview: N files will be included from: <root>
 ```
 
-The Export Preview in the baseline does not open a detailed file list.
+Export Preview does not open a detailed file list and does not write the dump.
 
-It does not write the dump.
+Preview uses the same naming resolver as Export: when `llm` is selected, the effective output considered is the `_LLM` variant.
 
 ---
 
@@ -635,16 +728,19 @@ It does not write the dump.
 ```text
 1. root validation
 2. pattern parsing
-3. output calculation
-4. scanning
-5. file reading
-6. metadata construction
-7. PROJECT TREE construction
-8. dump rendering
-9. UTF-8 write
-10. optional timestamp cleanup
-11. silent config save
-12. log and final dialog
+3. export_format normalization
+4. standard/LLM output resolution
+5. calculation of output variants to exclude
+6. scan
+7. file reads
+8. metadata construction for each entry
+9. PROJECT TREE construction
+10. optional FILE INDEX construction
+11. standard or llm rendering
+12. UTF-8 write
+13. optional timestamp cleanup
+14. silent config save
+15. log and final dialog
 ```
 
 The result reports:
@@ -653,12 +749,25 @@ The result reports:
 Included
 Skipped read errors
 Output
-optional timestamp cleanup
+[optional timestamp cleanup]
 ```
+
+File content is collected once into the `ExportFileEntry` structure; the selected renderer decides which metadata to add around the payload.
 
 ---
 
 # 19. DumpIt Dump Format
+
+DumpIt supports two export formats:
+
+```text
+standard
+llm
+```
+
+Both contain `FILE` sections with the complete textual content of included files.
+
+## 19.1 Standard Format
 
 Structure:
 
@@ -680,31 +789,111 @@ files_included: ...
 ...
 ```
 
-Minimal example:
+The Standard format remains compatible with historical behavior: introducing LLM mode does not add stable IDs, hashes, or a `FILE INDEX` to Standard rendering.
+
+## 19.2 LLM Format
+
+Structure:
 
 ```text
 ===== DUMPIT EXPORT =====
-timestamp_utc: 2026-08-28 20:50:52 UTC
-root: H:\DEV\PROJECT
-output: H:\DUMPS\PROJECT.txt
-profile: Project
-files_included: 2
+format_version: 2
+export_format: llm
+timestamp_utc: ...
+root: ...
+output: ...
+profile: ...
+files_included: ...
 
 ===== PROJECT TREE =====
-README.md [lines: 20 | modified=2026-08-28 18:10:00]
-src/
-  main.py [lines: 50 | modified=2026-08-28 18:11:00]
-
-===== FILE: README.md | lines=20 | modified=2026-08-28 18:10:00 =====
 ...
 
-===== FILE: src/main.py | lines=50 | modified=2026-08-28 18:11:00 =====
+===== FILE INDEX =====
+F-... | relative/path.ext | ext=.ext | bytes=N | lines=N | sha256=...
+...
+
+===== FILE: <path> | lines=<N> | id=F-... | bytes=N | sha256=... | modified=<timestamp> =====
+<content>
+
+===== FILE: ...
 ...
 ```
 
-The general dump timestamp is UTC.
+The LLM format is **lossless with respect to the DumpIt textual payload**: it does not minify, compress, remove comments, renumber lines, or intentionally modify file content.
 
-The `modified` date comes from the file's filesystem metadata.
+## 19.3 LLM Metadata per File
+
+For each file, DumpIt computes:
+
+```text
+stable_id
+extension
+byte_count
+content_sha256
+line_count
+modified_at
+```
+
+### stable_id
+
+Format:
+
+```text
+F-<16 hex>
+```
+
+It is derived from SHA-256 of the normalized relative path, taking the first 16 hexadecimal characters and adding the `F-` prefix.
+
+Normalization:
+
+```text
+\ -> /
+leading ./ removed
+```
+
+Properties:
+
+```text
+same relative path, different content -> same stable_id
+different relative path / rename      -> different stable_id
+different repository root, same relpath -> same stable_id
+```
+
+The stable ID therefore represents the identity of the **relative path**, not the content.
+
+### byte_count
+
+`bytes` is the byte length of the UTF-8 encoding of the text actually exported:
+
+```text
+len(text.encode("utf-8"))
+```
+
+It is not necessarily equal to the original physical file size on the filesystem if the file underwent BOM/fallback decoding or replacement characters.
+
+### content_sha256
+
+This is the SHA-256 of the same UTF-8 payload used for `byte_count`.
+
+It describes the textual content actually inserted into the dump.
+
+### extension
+
+This is the path suffix converted to lowercase, for example:
+
+```text
+.py
+.js
+.md
+```
+
+It may be empty for files without an extension.
+
+## 19.4 Operational Compatibility
+
+The Import/Diff parser continues to use `===== FILE:` headers as section boundaries. Additional LLM sections (`FILE INDEX`, global metadata) appear before file blocks and do not alter extracted content.
+
+There is no `END FILE` marker: the next `FILE` header delimits the current block.
 
 ---
 
@@ -712,17 +901,55 @@ The `modified` date comes from the file's filesystem metadata.
 
 The Project Tree is built only from files actually included.
 
+Directories are ordered before files and sorting is case-insensitive.
+
+## 20.1 Standard Project Tree
+
 For each file it shows:
 
 ```text
 name
 line count
-last modified time
+last modification
 ```
 
-Directories are sorted before files.
+Example:
 
-Sorting is case-insensitive.
+```text
+src/
+  main.py [lines: 50 | modified: 2026-09-05 09:10:00]
+```
+
+## 20.2 LLM Project Tree
+
+For each file it shows:
+
+```text
+name
+stable_id
+line count
+byte_count
+```
+
+Example:
+
+```text
+src/
+  main.py [F-a1b2c3d4e5f60718 | 50 lines | 1840 bytes]
+```
+
+`modified` is intentionally omitted from the LLM tree to reduce volatile metadata. It remains available in the header of the corresponding `FILE` section.
+
+## 20.3 LLM FILE INDEX
+
+LLM format adds a linear index after the Project Tree:
+
+```text
+===== FILE INDEX =====
+F-... | src/main.py | ext=.py | bytes=1840 | lines=50 | sha256=...
+```
+
+The FILE INDEX always uses relative paths and preserves the same ordering as exported entries. It does not replace file content; it is a navigation index.
 
 ---
 
@@ -756,27 +983,48 @@ Import does not delete extra files already present in the target.
 
 # 22. Dump Formats Accepted by Import
 
-The parser recognizes sections of the form:
+The parser recognizes file sections delimited by `===== FILE:` headers.
+
+Legacy format:
 
 ```text
 ===== FILE: <path> =====
 ```
 
-and the current format:
+Current Standard format:
 
 ```text
 ===== FILE: <path> | lines=N | modified=... =====
 ```
 
-The parser treats the content between one `FILE` section and the next as that file's content.
+LLM format:
 
-If it finds no valid file sections:
+```text
+===== FILE: <path> | lines=N | id=F-... | bytes=N | sha256=... | modified=... =====
+```
+
+Path extraction truncates metadata starting at the ` | lines=` marker. This is why LLM headers remain backward-compatible with Import and Diff.
+
+The parser treats the content between one `FILE` section and the next as the file payload.
+
+Sections before the first `FILE`, including:
+
+```text
+PROJECT TREE
+FILE INDEX
+format_version
+export_format
+```
+
+are not imported as files and do not alter the payload.
+
+If no valid file sections are found:
 
 ```text
 No DumpIt file sections found
 ```
 
-and the import fails.
+and import fails.
 
 ---
 
@@ -790,7 +1038,7 @@ root: <source root>
 
 before the first file section.
 
-If a file header is absolute, it is accepted only when it can be made relative to the root declared in the dump.
+If a file header is absolute, it is accepted only if it can be made relative to the root declared in the dump.
 
 Example:
 
@@ -816,11 +1064,11 @@ Import rejects or skips paths that are:
 ```text
 empty
 absolute and not reducible to the dump root
-containing ..
-containing NUL
-containing : in a relative component
+contain ..
+contain NUL
+contain : in a relative component
 duplicates after normalization
-pointing to an already-existing directory
+point to an already existing directory
 ```
 
 Unsafe items are counted as:
@@ -850,7 +1098,7 @@ Will skip existing
 Skipped invalid/unsafe
 ```
 
-If the target does not exist, DumpIt asks whether it should be created.
+If the target does not exist, DumpIt asks whether to create it.
 
 ---
 
@@ -874,7 +1122,7 @@ With the option disabled:
 skip_existing
 ```
 
-Import does not semantically compare file contents; path existence determines the behavior.
+Import does not semantically compare content; path existence determines behavior.
 
 ---
 
@@ -886,7 +1134,7 @@ With:
 Backup overwritten files to .dumpit_import_backup = ON
 ```
 
-overwritten files are copied before writing into:
+files to be overwritten are copied before writing to:
 
 ```text
 <target>/.dumpit_import_backup/YYYYMMDD_HHMMSS/
@@ -906,8 +1154,8 @@ The backup covers **overwritten** files, not newly created files.
 1. rebuilds the plan
 2. shows counts
 3. requests confirmation
-4. performs create/overwrite/skip
-5. backs up overwritten files when requested
+4. executes create/overwrite/skip
+5. backs up overwrites when requested
 6. saves config
 7. shows the final result
 ```
@@ -927,14 +1175,13 @@ Backup path, if present
 
 Import writes items sequentially.
 
-The baseline does not implement a global atomic commit for the entire plan.
+The baseline has no global atomic commit for the whole plan.
 
 Therefore, a filesystem error during execution can theoretically occur after some files have already been written.
 
-For destructive operations, use backup and, when possible, version control.
+For destructive operations, use backup and, where possible, version control.
 
 ---
-
 # 29. Watch
 
 The Watch tab implements continuous monitoring through polling.
@@ -951,7 +1198,7 @@ Stop
 Export now
 ```
 
-Displayed state:
+Displayed status:
 
 ```text
 Status
@@ -959,6 +1206,10 @@ Profile locked at start
 Last change
 Last automatic export
 ```
+
+Watch supports both `export_format` values.
+
+When the current format is `llm`, the resolver uses the `_LLM` output; when it is `standard`, it uses the normal output. In both cases, monitoring excludes from its scan both the Standard and LLM families of the same base output.
 
 ---
 
@@ -972,7 +1223,7 @@ Default:
 1500 ms
 ```
 
-DumpIt validates that it is a positive integer.
+DumpIt validates that it is a positive integer value.
 
 ---
 
@@ -992,7 +1243,7 @@ Purpose:
 avoid one export for every individual write in a burst
 ```
 
-While changes continue arriving, export is postponed until the quiet period expires.
+When changes keep arriving, export is postponed until the quiet period expires.
 
 ---
 
@@ -1016,7 +1267,19 @@ modified
 removed
 ```
 
-The DumpIt output and the corresponding timestamped output family are excluded from monitoring.
+The resolver determines the effective output from `export_format`.
+
+The following are excluded from the scan:
+
+```text
+current output
+Standard base
+LLM base
+Standard timestamped family
+LLM timestamped family
+```
+
+This prevents switching between `standard` and `llm` from generating false Watch events or self-including the dump from the other format.
 
 ---
 
@@ -1028,7 +1291,7 @@ The DumpIt output and the corresponding timestamped output family are excluded f
 validates Poll and Quiet
 reads current Export settings
 stores the active profile
-builds the initial snapshot
+prepares the initial snapshot
 locks the configuration used for monitoring
 saves config
 starts polling
@@ -1044,11 +1307,11 @@ an export is requested immediately.
 
 ---
 
-# 34. Actual Watch Behavior to Know
+# 34. Effective Watch Behavior to Know
 
-The configuration used to **detect changes** is copied into Watch state at Start time.
+The configuration used to **detect changes** is copied into Watch runtime state at Start.
 
-Automatic export, however, calls the normal `_run_export()` in the baseline, which reads the current Export UI variables at execution time.
+Automatic export calls the normal `_run_export()`, which reads the current Export UI variables at execution time.
 
 Therefore:
 
@@ -1058,20 +1321,23 @@ monitoring snapshot
 
 automatic export
     uses current UI values
+    including export_format
 ```
 
 For predictable behavior:
 
 ```text
-do not change profile or Export settings
+do not change profile, filters, output, or Export format
 while Watch is active
 ```
 
 or stop Watch, change configuration, and start it again.
 
+`_LLM` naming is resolved centrally, so Preview/Watch/Export use the same output rule.
+
 ---
 
-# 35. Stopping Watch
+# 35. Stop Watch
 
 `Stop`:
 
@@ -1088,7 +1354,7 @@ Closing DumpIt automatically stops Watch.
 
 # 36. Export Now in the Watch Tab
 
-`Export now` invokes the normal current Export.
+`Export now` invokes the current normal Export.
 
 Watch does not need to be active.
 
@@ -1102,7 +1368,7 @@ current profile/UI
 
 # 37. Batch
 
-Batch allows the same type of operation to run across multiple profiles.
+Batch allows the same type of operation to be run across multiple profiles.
 
 Controls:
 
@@ -1116,13 +1382,27 @@ Run batch preview
 Run batch export
 ```
 
-The profile selection is persisted in the application section of the INI file.
+Profile selection is persisted in the application section of the INI file.
+
+Each profile may independently use:
+
+```text
+export_format = standard
+```
+
+or:
+
+```text
+export_format = llm
+```
+
+Therefore, a single Batch run may produce Standard output for some profiles and LLM output for others.
 
 ---
 
 # 38. Fundamental Batch Rule
 
-Batch uses the **saved profile settings**.
+Batch uses the **saved profile settings**, including `export_format`.
 
 The UI itself states:
 
@@ -1130,7 +1410,16 @@ The UI itself states:
 Batch uses the saved profile settings — click 'Save' if needed.
 ```
 
-When a batch starts, DumpIt silently saves the current profile and then reads profile sections from configuration.
+At the start of a batch, DumpIt silently saves the current profile, then reads profile sections from configuration.
+
+For each profile, the resolver computes the effective output name:
+
+```text
+standard -> normal base
+llm      -> base with _LLM
+```
+
+An unsaved format change may therefore not be used by Batch.
 
 ---
 
@@ -1139,10 +1428,12 @@ When a batch starts, DumpIt silently saves the current profile and then reads pr
 For each selected profile:
 
 ```text
-validates root
+checks root
 applies include/exclude
 applies skip binary
-calculates output to exclude
+reads saved export_format
+resolves standard/LLM output
+computes both output families to exclude
 counts files
 writes result to log
 ```
@@ -1157,13 +1448,15 @@ For each selected profile:
 
 ```text
 reads saved settings
-performs export
-performs timestamp retention if enabled
-logs the result
+normalizes export_format
+resolves standard/LLM output
+exports with the correct renderer
+runs timestamp retention if enabled
+logs result
 continues with the next profile
 ```
 
-An error in one profile is logged as `ERR` but does not necessarily stop processing of subsequent profiles.
+An error in one profile is logged as `ERR` but does not necessarily prevent processing of subsequent profiles.
 
 Final result:
 
@@ -1171,6 +1464,8 @@ Final result:
 OK N
 Errors N
 ```
+
+Batch uses the same `export_to_file()` as normal Export; there is no separate Batch renderer.
 
 ---
 
@@ -1198,7 +1493,7 @@ Save delta file
 
 # 42. Diff Semantics
 
-The parser transforms each dump into:
+The parser converts each dump into:
 
 ```text
 path -> content
@@ -1217,10 +1512,10 @@ Rules:
 
 ```text
 added
-    path exists only in New
+    path present only in New
 
 removed
-    path exists only in Old
+    path present only in Old
 
 modified
     same path, different content
@@ -1229,7 +1524,19 @@ unchanged
     same path, identical content
 ```
 
-Comparison is performed on the full content of each file section.
+Comparison is based on the complete content of the file section.
+
+LLM metadata outside the payload (`FILE INDEX`, stable ID, hash, byte count) is not compared as file content.
+
+With the same files and the same `Full path header` convention:
+
+```text
+Standard dump
+vs
+LLM dump
+```
+
+produces the same `path -> content` snapshots; therefore Diff must report no file differences if the repository has not changed.
 
 ---
 
@@ -1237,7 +1544,7 @@ Comparison is performed on the full content of each file section.
 
 Diff uses the path in the `FILE` header as identity.
 
-Therefore it is important to compare dumps produced using consistent conventions.
+Therefore, dumps should be compared using consistent path conventions.
 
 Problematic example:
 
@@ -1249,15 +1556,19 @@ New:
     C:\PROJECT\src\a.py
 ```
 
-Even if they refer to the same physical file, the parser sees two different keys.
+Even if they represent the same physical file, the parser sees two different keys.
 
-For regular comparisons, keep the following option consistent:
+For regular comparisons, keep the option:
 
 ```text
 Full path header
 ```
 
-across both dumps.
+consistent between dumps.
+
+The difference between `standard` and `llm` **does not** itself change file identity: the parser ignores additional metadata after `| lines=`.
+
+In LLM format, the `FILE INDEX` always uses relative paths, but Diff continues to use the path from the `FILE` header, not the index.
 
 ---
 
@@ -1268,7 +1579,7 @@ across both dumps.
 ```text
 loads Old
 loads New
-calculates delta
+computes delta
 generates local HTML
 opens the default browser
 ```
@@ -1285,7 +1596,7 @@ with names such as:
 dumpit_diff_<timestamp>.html
 ```
 
-DumpIt cleans these temporary files:
+DumpIt cleans up these temporary files:
 
 ```text
 at startup
@@ -1297,7 +1608,7 @@ at shutdown
 
 # 45. .txt Delta
 
-The text format contains:
+The textual format contains:
 
 ```text
 ===== DUMPIT DELTA =====
@@ -1318,8 +1629,8 @@ ADDED FILES
 REMOVED FILES
 MODIFIED FILES
 
-full content of added files
-full content of removed files
+complete content of added files
+complete content of removed files
 unified diff of modified files
 ```
 
@@ -1466,12 +1777,12 @@ to obtain:
 src/file.py
 ```
 
-The value in the Strip field acts as:
+The value in the Strip field is:
 
 ```text
-an effective constraint when Auto-detect is OFF
+the effective constraint when Auto-detect is OFF
 
-an initial preference when Auto-detect is ON
+the initial preference when Auto-detect is ON
 ```
 
 ---
@@ -1509,7 +1820,7 @@ Resolved:
 Patch SHA256
 ```
 
-If the resolved mapping differs from the requested values:
+If the resolved mapping differs from requested values:
 
 ```text
 AUTO-DETECT OVERRIDE
@@ -1521,9 +1832,9 @@ The Apply dialog shows Requested and Resolved again before confirmation.
 
 # 52. Resolution Cache
 
-When a resolution has been calculated for the current selection, DumpIt retains it.
+Once a resolution has been computed for the current selection, DumpIt keeps it.
 
-Preview, Dry run, and Apply reuse the same resolution as long as the patch-related UI state does not change.
+Preview, Dry run, and Apply reuse the same resolution as long as patch settings do not change.
 
 The cache is invalidated if any relevant parameter changes, including:
 
@@ -1538,7 +1849,7 @@ backup
 engine
 ```
 
-Before the operation, DumpIt recalculates the mapping anyway and refuses the operation if it no longer matches the resolved mapping.
+Before the operation, DumpIt still recomputes the mapping and refuses the operation if it no longer matches the resolved mapping.
 
 Conceptual message:
 
@@ -1551,21 +1862,21 @@ Operation refused; run Preview again.
 
 # 53. Patch Mapping Safety
 
-The full mapping is validated before Apply.
+The complete mapping is validated before Apply.
 
 DumpIt rejects:
 
 ```text
 paths that do not survive strip
-paths escaping the resolved cwd
-paths escaping the selected target
+paths that escape the resolved cwd
+paths that escape the selected target
 many-to-one collisions
 patches without file paths
 ```
 
-During auto-detect it also rejects a candidate where a create-file patch maps to an already-existing target.
+During auto-detect, it also rejects a candidate where a create-file patch maps onto an already existing target.
 
-Forbidden collision example:
+Example of a forbidden collision:
 
 ```text
 a/BRIDGES/README.md   --p2--> README.md
@@ -1573,28 +1884,28 @@ a/HOUSES/README.md    --p2--> README.md
 a/WAREHOUSE/README.md --p2--> README.md
 ```
 
-That candidate is invalid.
+The candidate is invalid.
 
 ---
 
 # 54. DumpIt Engine
 
-`dumpit` is the internal text patch engine.
+`dumpit` is the internal text engine.
 
 Properties:
 
 ```text
 parses unified diff
 builds a complete plan
-validates every hunk
-does not write if any hunk failed
+validates all hunks
+writes nothing if failed hunks exist
 supports controlled hunk relocation
 detects already-applied hunks
 preserves newline and existing-file encoding as implemented
-supports text create / modify / delete
+supports textual create / modify / delete
 ```
 
-It is the default engine.
+It is the default.
 
 ---
 
@@ -1608,11 +1919,11 @@ Validation first uses:
 git apply --check
 ```
 
-DumpIt auto-detection still selects the safe candidate mapping before invoking Git.
+DumpIt auto-detect still determines a safe candidate mapping before invoking Git.
 
 The Git engine requires `git` to be available on the system.
 
-It is necessary when the patch semantics require capabilities not handled by the DumpIt text engine, for example Git binary patches.
+It is required when patch semantics need capabilities not handled by the DumpIt text engine, for example Git binary patches.
 
 ---
 
@@ -1671,16 +1982,16 @@ FAILED_NOT_FOUND
     the old block was not found in an applicable way
 
 FAILED_AMBIGUOUS
-    multiple candidate positions make the hunk non-deterministic
+    multiple candidate locations make the hunk nondeterministic
 
 FAILED_FILE_MISSING
-    the file required by the modification does not exist
+    the file required for modification does not exist
 ```
 
 If the plan contains failed hunks:
 
 ```text
-the DumpIt engine writes no files
+no file is written by the DumpIt engine
 ```
 
 ---
@@ -1691,15 +2002,15 @@ the DumpIt engine writes no files
 
 ```text
 resolves mapping
-writes it to the log
+records it in the log
 revalidates it
 builds the plan
 does not write the target
-generates a before/after visual diff HTML
+generates a visual before/after HTML diff
 opens the browser
 ```
 
-It shows counts for:
+It shows counts:
 
 ```text
 Added
@@ -1714,9 +2025,9 @@ For the DumpIt engine, hunk states are also logged.
 
 # 59. Patch Dry Run
 
-`Dry run` executes the validation path for the operation without applying the final modifications.
+`Dry run` executes the validation path of the operation without applying final changes.
 
-It should be used before Apply when the patch changes important data.
+It should be used before Apply when the patch modifies important data.
 
 ---
 
@@ -1763,7 +2074,7 @@ while preserving relative structure.
 
 New files obviously have no previous version to save.
 
-Backup does not replace version control or testing.
+Backup does not replace version control or tests.
 
 ---
 
@@ -1823,9 +2134,9 @@ Reverse (-R) = ON
 
 ## 63.1 Reverse with Auto-detect ON
 
-DumpIt does not perform a new unrestricted auto-detect.
+DumpIt does not run a new free auto-detect.
 
-It looks for the forward Apply receipt and reuses:
+It looks for the receipt from the forward Apply and reuses:
 
 ```text
 resolved cwd
@@ -1834,7 +2145,7 @@ resolved strip
 mapping
 ```
 
-Before Reverse it verifies:
+Before Reverse it checks:
 
 ```text
 patch digest
@@ -1889,7 +2200,7 @@ The application also has a shared log.
 Primary rule:
 
 ```text
-generate the patch against the latest source/dump available
+generate the patch against the most recent available source/dump
 ```
 
 Use standard unified diff with paths:
@@ -1905,13 +2216,13 @@ and normally:
 -p1
 ```
 
-Hunks must contain enough context to be unique.
+Hunks should contain enough context to be unique.
 
 Avoid:
 
 ```text
 overly generic blocks
-create patches for files that already exist
+create patches against already existing files
 absolute paths
 ..
 target collisions
@@ -1932,11 +2243,11 @@ Project_STEP_B.patch
 Project_STEP_C.patch
 ```
 
-over one patch mixing independent interventions.
+to one patch that mixes independent interventions.
 
-A patch may modify multiple files when they are all required by the same step.
+A patch may modify multiple files if they are all required by the same step.
 
-When appropriate, include tests verifying the step in the same patch.
+When appropriate, include in the same patch the tests that verify the step.
 
 ---
 
@@ -1965,13 +2276,13 @@ When a patch fails, collect:
 ```text
 Copy log
 original patch
-latest source/dump of the target
+most recent source/dump of the target
 ```
 
 Common causes:
 
 ```text
-stale baseline
+outdated baseline
 file moved
 file renamed
 hunk context changed
@@ -1985,15 +2296,14 @@ binary patch used with DumpIt engine
 filesystem changed after forward Apply
 ```
 
-Do not blindly change `-p` or line numbers just to force Apply.
+Do not blindly change `-p` or line numbers to force Apply.
 
 ---
-
 # 69. Shared Log
 
-The lower part of the window contains a shared log.
+The lower part of the window contains a common log.
 
-Main functions record information such as:
+Main functions write to it:
 
 ```text
 config load/save
@@ -2009,7 +2319,7 @@ backup
 operational errors
 ```
 
-The source also contains a function for copying the full log to the clipboard.
+The source also contains a function to copy the entire log to the clipboard.
 
 ---
 
@@ -2027,7 +2337,7 @@ Windows example:
 %APPDATA%\DumpIt\dumpit.crash.log
 ```
 
-The error is also shown through a message box when possible.
+The error is also shown in a message box when possible.
 
 ---
 
@@ -2062,11 +2372,11 @@ Temporary visual diffs
 Complete workflow:
 
 ```text
-EXPORT OLD
+EXPORT OLD (standard or llm)
     ↓
 project changes
     ↓
-EXPORT NEW
+EXPORT NEW (standard or llm)
     ↓
 DIFF
     ↓
@@ -2075,7 +2385,7 @@ Save delta file .patch
 APPLY PATCH to a compatible target
 ```
 
-This allows DumpIt to be used as a text-based pipeline:
+This allows DumpIt to be used as a textual pipeline:
 
 ```text
 snapshot
@@ -2084,7 +2394,9 @@ patch
 apply
 ```
 
-It does not replace Git as a version-control system, but it can also operate on projects or workflows where a text dump is the primary exchange artifact.
+Standard and LLM are two representations of the same project payload. For Diff/patch, what matters is the content extracted from `FILE` sections, not the `FILE INDEX`.
+
+This does not replace Git as a version-control system, but it can operate on projects or contexts where a textual dump is the primary exchange artifact.
 
 ---
 
@@ -2094,32 +2406,45 @@ Workflow:
 
 ```text
 PROJECT A
-    ↓ Export
+    ↓ Export standard or llm
 DUMP
     ↓ Import
 TARGET B
 ```
 
-Import reconstructs only files present in the dump.
+Import reconstructs only files present in the dump's `FILE` sections.
 
-It does not replicate:
+In LLM format it does not import:
+
+```text
+FILE INDEX
+stable_id
+byte_count
+content_sha256
+format_version
+export_format
+```
+
+as separate files; these elements are container metadata.
+
+Import does not replicate:
 
 ```text
 files excluded by the profile
-binary files skipped
+skipped binary files
 complete filesystem metadata
 permissions
 extra files to delete
 empty directories not represented by files
 ```
 
-Import is therefore a reconstruction of the **exported text content**, not a byte-perfect clone of the entire filesystem.
+Import is therefore a reconstruction of the **exported textual content**, not a byte-perfect clone of the entire filesystem.
 
 ---
 
 # 74. Structural Limitations of the DumpIt Format
 
-The dump is designed for text sources.
+The dump is designed for textual source files.
 
 It does not fully represent:
 
@@ -2134,22 +2459,35 @@ extended attributes
 empty directories
 ```
 
-`modified` in the Project Tree and file headers is informational.
+`modified` in headers is informational.
 
-Import writes contents as UTF-8 and does not restore the original encoding of an exported file.
+In Standard format it also appears in the Project Tree; in LLM format it is omitted from the Project Tree but remains in the `FILE` header.
+
+Import writes content as UTF-8 and does not restore the original encoding of the exported file.
+
+In LLM format:
+
+```text
+bytes  = size of the exported UTF-8 payload
+sha256 = hash of the exported UTF-8 payload
+```
+
+These fields do not claim byte-perfect identity with the original file if reading required decoding/fallback.
+
+The `stable_id` is path-derived: it is not a content hash and must not be used as proof that two contents are identical.
 
 ---
 
 # 75. Diff Limitations
 
-Diff compares text extracted from dumps.
+Diff compares text extracted from the dump.
 
 Therefore it:
 
 ```text
-does not compare files absent from the dumps
+does not compare files not included in the dumps
 does not compare filesystem metadata
-does not reconstruct file-rename identity
+does not reconstruct identity across file renames
 ```
 
 A rename normally appears as:
@@ -2170,11 +2508,15 @@ Implications:
 
 ```text
 changes are observed at the next poll
-cost increases with the number of monitored files
-each snapshot also calculates file digests
+cost grows with the number of monitored files
+each snapshot also computes file digests
 ```
 
 The quiet period reduces repeated exports during bursts of changes.
+
+LLM mode does not change detection. It changes only rendering and output naming.
+
+DumpIt excludes both Standard/LLM families from Watch, but other dumps with unrelated basenames may still be observed if they match Include patterns.
 
 ---
 
@@ -2193,7 +2535,7 @@ The Git engine:
 requires Git to be installed
 ```
 
-A successful Apply guarantees that the patch was applied according to the selected engine; it does not guarantee that the project is functionally correct.
+A successful Apply guarantees that the patch was applied according to the selected engine, not that the project is functionally correct.
 
 Always run the relevant tests after Apply.
 
@@ -2209,7 +2551,7 @@ Always run the relevant tests after Apply.
 5. Preview
 6. check file count
 7. Export
-8. retain the resulting dump
+8. keep the resulting dump
 ```
 
 ---
@@ -2238,8 +2580,8 @@ automatic cleanup of older snapshots
 1. configure and Save the profile
 2. start Watch
 3. avoid profile/settings changes while Watch is active
-4. inspect Last change
-5. inspect Last automatic export
+4. observe Last change
+5. observe Last automatic export
 6. Stop before changing configuration
 ```
 
@@ -2269,7 +2611,7 @@ Save delta file
 1. select dump
 2. select target
 3. choose Overwrite
-4. leave Backup ON if files already exist
+4. leave Backup ON if files exist
 5. Preview import
 6. check create/overwrite/skip/unsafe
 7. Import dump
@@ -2286,7 +2628,7 @@ PATCH
 TARGET
 ↓
 Engine = dumpit for normal text patches
--p1 as default for Git-style a/... b/... paths
+-p1 as default for Git paths a/... b/...
 Auto-detect ON
 Backup ON
 ↓
@@ -2314,7 +2656,7 @@ Auto-detect ON
 ↓
 DumpIt loads forward receipt
 ↓
-verifies post-state
+checks post-state
 ↓
 Preview
 ↓
@@ -2362,11 +2704,39 @@ Skip binary
 correct root
 ```
 
-## The dump includes a previous output
+## The dump includes the previous output
 
-The baseline automatically excludes the current output and the associated timestamped family.
+DumpIt automatically excludes:
 
-If an older dump with a different name appears, add it to excludes or change pattern/output settings.
+```text
+current output
+Standard variant
+LLM variant
+related timestamped families
+```
+
+If an old dump with a **different basename** appears, add it to excludes or change patterns/output.
+
+## The LLM name does not contain `_LLM`
+
+Check that:
+
+```text
+Export format = llm
+```
+
+The resolver normally produces:
+
+```text
+name.txt -> name_LLM.txt
+name_YYYY-...txt -> name_LLM_YYYY-...txt
+```
+
+If the basename already ends in `_LLM`, a second suffix is not added.
+
+## The Standard name contains `_LLM`
+
+`standard` mode does not forcibly remove an `_LLM` written manually in the Output file field. Set a base output without `_LLM` if conventional Standard naming is desired.
 
 ## Import skips files
 
@@ -2378,7 +2748,7 @@ Causes:
 absolute path outside root
 ..
 duplicate
-target directory where a file is expected
+target directory instead of file
 :
 NUL
 ```
@@ -2401,6 +2771,10 @@ Quiet ms
 Status
 ```
 
+## Watch exports in the unexpected format
+
+Automatic export reads current Export UI settings, including `export_format`. Avoid changing format while Watch is active, or restart Watch after the change.
+
 ## Batch uses old values
 
 Save the profile:
@@ -2409,19 +2783,34 @@ Save the profile:
 Save
 ```
 
-Batch uses persisted settings.
+Batch uses persisted settings, including `export_format`.
+
+## Diff Standard vs LLM shows unexpected differences
+
+With the same repository it should produce the same file/content snapshot.
+
+Check:
+
+```text
+consistent Full path header
+consistent Include/Exclude
+same logical root
+no changes between the two exports
+```
+
+The LLM `FILE INDEX` should not produce differences by itself.
 
 ## Diff shows files as added/removed instead of modified
 
-Probable file-header path mismatch.
+Likely path-header mismatch.
 
-Check that both dumps use either:
+Check that both dumps use:
 
 ```text
 Full path header OFF
 ```
 
-or both use ON with a compatible root convention.
+or both use ON with compatible roots.
 
 ## Patch FAILED_NOT_FOUND
 
@@ -2431,13 +2820,13 @@ Use an updated source/dump and regenerate the patch.
 
 ## Patch FAILED_AMBIGUOUS
 
-The hunk context does not identify a single location.
+The hunk context does not identify exactly one location.
 
 Regenerate the patch with more context.
 
 ## Patch FAILED_FILE_MISSING
 
-The expected file does not exist at the resolved mapping.
+The expected file does not exist in the resolved mapping.
 
 Check target, strip, and baseline.
 
@@ -2445,17 +2834,17 @@ Check target, strip, and baseline.
 
 No combination proposed by auto-detect passes the safety preflight.
 
-Do not force it: inspect the patch structure and target root.
+Do not force it: check patch structure and target root.
 
 ## Git apply unavailable
 
-Install Git, or use the DumpIt engine if the patch is compatible with the text engine.
+Install Git or use the DumpIt engine if the patch is compatible with the text engine.
 
 ## Reverse refused
 
 The post-state does not match the receipt.
 
-The filesystem changed after the forward operation, or patch/target/engine do not correspond to the receipt.
+The filesystem changed after the forward operation, or patch/target/engine do not match the receipt.
 
 ---
 
@@ -2466,14 +2855,27 @@ The filesystem changed after the forward operation, or patch/target/engine do no
 [ ] correct Project folder
 [ ] correct Include patterns
 [ ] correct Exclude folders
-[ ] correct Output file
+[ ] correct base Output file
+[ ] correct Export format: standard | llm
+[ ] if llm, expected effective output with _LLM
 [ ] Timestamp appropriate for intended use
 [ ] valid Keep old
-[ ] Skip binary appropriate
-[ ] Full path header consistent with Diff/Import use
-[ ] Preview completed
+[ ] appropriate Skip binary
+[ ] Full path header consistent with Diff/Import
+[ ] Preview run
 [ ] plausible file count
-[ ] Export completed
+[ ] Export run
+[ ] if llm, indexed PROJECT TREE present
+[ ] if llm, FILE INDEX present
+[ ] if llm, FILE header with id/bytes/sha256
+```
+
+For Standard ↔ LLM verification of the same project:
+
+```text
+[ ] same filters
+[ ] same Full path header convention
+[ ] Diff = 0 differences in files/content
 ```
 
 ---
@@ -2483,14 +2885,14 @@ The filesystem changed after the forward operation, or patch/target/engine do no
 ```text
 [ ] correct dump
 [ ] correct target
-[ ] Preview import completed
-[ ] create count plausible
-[ ] overwrite count plausible
+[ ] Preview import run
+[ ] plausible create count
+[ ] plausible overwrite count
 [ ] skip existing understood
 [ ] unsafe paths reviewed
-[ ] Backup ON if required
-[ ] confirm Import
-[ ] verify final result
+[ ] Backup ON if needed
+[ ] Import confirmed
+[ ] final result verified
 ```
 
 ---
@@ -2515,16 +2917,16 @@ The filesystem changed after the forward operation, or patch/target/engine do no
 [ ] correct target root
 [ ] correct engine
 [ ] correct requested strip
-[ ] Auto-detect selected intentionally
+[ ] Auto-detect chosen deliberately
 [ ] Backup ON
-[ ] Preview successful
+[ ] Preview succeeded
 [ ] Requested verified
 [ ] Resolved verified
 [ ] Patch SHA256 visible
-[ ] mapping plausible and collision-free
-[ ] Dry run successful
+[ ] plausible collision-free mapping
+[ ] Dry run succeeded
 [ ] Apply confirmed
-[ ] project tests executed
+[ ] project tests run
 ```
 
 ---
@@ -2535,7 +2937,7 @@ The filesystem changed after the forward operation, or patch/target/engine do no
 [ ] latest source/dump used as baseline
 [ ] valid unified diff
 [ ] paths relative to root
-[ ] a/ and b/ prefixes for standard Git-style patch
+[ ] a/ and b/ prefixes for standard Git patch
 [ ] -p1 normally expected
 [ ] no absolute paths
 [ ] no ..
@@ -2544,14 +2946,14 @@ The filesystem changed after the forward operation, or patch/target/engine do no
 [ ] new files use /dev/null
 [ ] deleted files use /dev/null
 [ ] no binary diff with DumpIt engine
-[ ] patch atomic with respect to the step
+[ ] patch atomic relative to the step
 [ ] no unrelated changes
-[ ] tests included when required
+[ ] tests included when needed
 ```
 
 ---
 
-# 91. DumpIt Project Structure in the Baseline
+# 91. Technical Structure of the DumpIt Project in the Current Baseline
 
 ```text
 .github/
@@ -2568,21 +2970,32 @@ dumpit_tool/
     test_dumpit_path_resolution_safety.py
     test_quota_imports.py
 
+    test_dumpit_llm_export_contract.py
+    test_dumpit_llm_export_metadata.py
+    test_dumpit_llm_export_renderer.py
+    test_dumpit_llm_project_tree.py
+    test_dumpit_llm_profile_routing.py
+    test_dumpit_llm_closure.py
+
   __init__.py
 
 exporter_gui.py
 QUOTA_MANIFEST.md
 ```
 
-The project is in an initial QUOTA migration.
+In the reconstructed baseline after LLM0–LLM5 + `_LLM` naming, `exporter_gui.py` contains 6338 lines.
+
+The project remains in an early QUOTA migration.
 
 `dumpit_tool/q0/basics.py` contains lower-level primitives, while `exporter_gui.py` remains the legacy composition/UI layer.
 
+The LLM patches were deliberately implemented without coupling this feature to the QUOTA refactoring: LLM format is an Export feature, not an architectural change to the project.
+
 ---
 
-# 92. Q0 Technical Responsibilities
+# 92. Technical Responsibilities of Q0
 
-The baseline declares the following in Q0:
+The baseline declares in Q0:
 
 ```text
 constants / theme values
@@ -2595,25 +3008,28 @@ patch backup path collection
 dump/import/diff value objects
 ```
 
-The QUOTA manifest identifies the extraction of pure application functions toward Q1 as the next ideal step, for example:
+The QUOTA manifest identifies extraction of pure application functions toward Q1 as the ideal next step, for example:
 
 ```text
 collect_files
 collect_export_entries
 render_export_text
+render_llm_export_text
 parse_dump_text
 build_dump_import_plan
 compare_dump_snapshots
 build_unified_patch
 ```
 
+In the current state, LLM mode is implemented in the existing composition/UI layer alongside the Standard renderer.
+
 This section describes the current architectural state of the project, not a UI function.
 
 ---
 
-# 93. Existing Patch Safety Tests
+# 93. Existing Safety and Compatibility Tests
 
-The baseline contains specific tests for:
+The baseline contains specific tests for the patch engine:
 
 ```text
 exact hunk
@@ -2632,16 +3048,52 @@ filesystem drift refusal
 root containment
 ```
 
-These tests document the guarantees introduced after earlier path-resolution problems.
+The LLM tranche adds dedicated tests for:
+
+```text
+unchanged Standard format
+legacy dump parsing
+metadata sections before FILE blocks
+additional metadata in FILE headers
+Import from LLM dump
+Diff Standard ↔ LLM
+path-derived stable ID
+stable ID independent of repository root
+rename -> different stable ID
+content change -> same stable ID / different hash
+UTF-8 byte_count
+content SHA-256
+deterministic FILE INDEX
+deterministic LLM Project Tree
+Full path header compatibility
+profile/config export_format
+legacy fallback -> standard
+Export routing
+Batch routing
+Watch routing
+idempotent _LLM naming
+_LLM suffix before timestamp
+mutual exclusion of Standard/LLM output families
+```
+
+These tests define the contract of LLM mode: add structure around the payload without changing Import/Diff semantics for the content.
 
 ---
 
-# 94. Final Operating Principles
+# 94. Final Operational Principles
 
 For Export:
 
 ```text
 Preview before Export.
+Explicitly choose standard or llm.
+```
+
+For LLM Export:
+
+```text
+The file payload remains authoritative and uncompressed.
+FILE INDEX and hashes are navigation/verification metadata.
 ```
 
 For Import:
@@ -2655,18 +3107,21 @@ For Batch:
 
 ```text
 Save before Batch.
+Format is part of the saved profile.
 ```
 
 For Watch:
 
 ```text
-keep configuration stable during monitoring.
+keep configuration stable during monitoring,
+including export_format.
 ```
 
 For Diff:
 
 ```text
-use consistent path headers across Old and New.
+keep path headers consistent between Old and New.
+Standard and LLM are comparable on payload.
 ```
 
 For Patch:
@@ -2695,21 +3150,32 @@ project tests validate behavior.
 ```text
 PROFILE
     defines persistent settings
+    including export_format
 
-EXPORT
-    project -> dump
+STANDARD EXPORT
+    project -> historical dump
+
+LLM EXPORT
+    project -> indexed lossless dump
+    compact PROJECT TREE
+    FILE INDEX
+    stable ID / bytes / sha256
+    output with _LLM suffix
 
 IMPORT
-    dump -> file tree
+    standard or llm dump -> file tree
 
 WATCH
     changes -> automatic export
+    standard or llm
 
 BATCH
-    saved profiles -> multi-profile preview/export
+    saved profiles -> multiple preview/export
+    each profile keeps its own format
 
 DIFF
     old dump + new dump -> visual / txt / patch
+    Standard and LLM compatible on FILE payload
 
 APPLY PATCH
     patch + target -> preview / dry-run / apply
@@ -2718,30 +3184,67 @@ REVERSE
     forward receipt + patch + target -> controlled reversal
 ```
 
+Key rule of LLM mode:
+
+```text
+DumpIt adds structure; it does not rewrite source.
+```
+
 ---
 
 # 96. Baseline and Manual Validity
 
-This manual describes behavior supported by the source baseline:
+This manual describes the supported behavior of the current state obtained from:
 
 ```text
-DumpIT_2026-08-28_225051.txt
+DumpIT_2026-09-04_100252.txt
++
+LLM0 — export contract guardrails
+LLM1 — deterministic file metadata
+LLM2 — LLM renderer + FILE INDEX
+LLM3 — compact LLM PROJECT TREE
+LLM4 — profile/UI/Batch/Watch routing
+LLM5 — compatibility closure
++
+LLM output name suffix patch
 ```
 
-The dump was produced on August 28, 2026.
+The documentation revision is dated:
 
-The DumpIt application files included in the baseline were mainly modified on August 14, 2026; the August 28 dump nevertheless represents the most recent source reference provided for this manual.
+```text
+2026-09-05
+```
 
-If the DumpIt source changes, the areas that should be reverified first are:
+LLM mode is deliberately language-agnostic. It does not introduce:
+
+```text
+symbol index
+static dependency analysis
+language-specific parser
+semantic chunking
+source compression
+token estimation
+ARCHIPELAGO awareness
+```
+
+If DumpIt source changes, the areas to revalidate first are:
 
 ```text
 profile defaults
-dump format
-Import path rules
-Watch behavior
-Batch persistence
-Diff format
+export_format and output naming
+Standard format
+LLM format
+stable ID / byte_count / content_sha256
+PROJECT TREE / FILE INDEX
+Import parser compatibility
+Watch output exclusion
+Batch persistence/routing
+Diff Standard ↔ LLM
 Apply Patch resolver
 receipt/reverse
 backup locations
 ```
+
+The manual treats Standard format as the backward-compatible baseline and LLM format as a lossless structural extension of the same textual snapshot.
+
+---
