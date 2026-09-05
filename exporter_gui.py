@@ -3318,6 +3318,12 @@ def _html_escape(text: str) -> str:
 
 
 DIFF_HTML_CONTEXT_LINES = 3
+DIFF_HTML_COLGROUP = (
+    "<colgroup>"
+    "<col class='col-ln'><col class='col-code'>"
+    "<col class='col-ln'><col class='col-code'>"
+    "</colgroup>"
+)
 
 
 def _render_html_skip_row(old_gap: int, new_gap: int) -> str:
@@ -3325,7 +3331,7 @@ def _render_html_skip_row(old_gap: int, new_gap: int) -> str:
     label = f"… {hidden} unchanged line{'s' if hidden != 1 else ''} hidden …"
     return (
         "<tr class='skip'>"
-        "<td class='ln'></td><td class='code skip-code' colspan='3'>"
+        "<td class='skip-code' colspan='4'>"
         f"{_html_escape(label)}"
         "</td></tr>"
     )
@@ -3405,7 +3411,7 @@ def _render_html_diff_table(old_text: str, new_text: str) -> str:
 
     if not ranges:
         rows.append("<tr class='eq'><td></td><td class='code'>No line differences.</td><td></td><td></td></tr>")
-        return "<table class='diff-table'><tbody>" + "\n".join(rows) + "</tbody></table>"
+        return "<table class='diff-table'>" + DIFF_HTML_COLGROUP + "<tbody>" + "\n".join(rows) + "</tbody></table>"
 
     previous_old_end = 0
     previous_new_end = 0
@@ -3430,7 +3436,7 @@ def _render_html_diff_table(old_text: str, new_text: str) -> str:
     if hidden_old or hidden_new:
         rows.append(_render_html_skip_row(hidden_old, hidden_new))
 
-    return "<table class='diff-table'><tbody>" + "\n".join(rows) + "</tbody></table>"
+    return "<table class='diff-table'>" + DIFF_HTML_COLGROUP + "<tbody>" + "\n".join(rows) + "</tbody></table>"
 
 
 def _render_file_block(diff: DumpDiffResult, status: str, path: str) -> str:
@@ -3535,11 +3541,12 @@ main {{ padding: 18px 42px 18px 18px; overflow: hidden; }}
 .file-head h2 {{ margin: 0; font-size: 14px; font-weight: 650; word-break: break-all; }}
 .badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 800; letter-spacing: .04em; }}
 .diff-table {{ width: 100%; border-collapse: collapse; table-layout: fixed; font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+.diff-table col.col-ln {{ width: 56px; }}
+.diff-table col.col-code {{ width: calc((100% - 112px) / 2); }}
 .diff-table td {{ border-bottom: 1px solid rgba(255,255,255,.04); vertical-align: top; }}
 tr.skip .skip-code {{ padding: 7px 10px; color: var(--muted); text-align: center; background: #0b1020; font-style: italic; }}
-tr.skip .ln {{ background: #0b1020; }}
-.ln {{ width: 56px; padding: 3px 8px; color: var(--muted); text-align: right; user-select: none; background: rgba(0,0,0,.16); }}
-.code {{ width: calc(50% - 56px); padding: 3px 10px; white-space: pre-wrap; word-break: break-word; }}
+.ln {{ padding: 3px 8px; color: var(--muted); text-align: right; user-select: none; background: rgba(0,0,0,.16); }}
+.code {{ padding: 3px 10px; white-space: pre-wrap; word-break: break-word; }}
 tr.eq .code {{ background: var(--eq); color: #d1d5db; }}
 tr.ins .new {{ background: var(--add-bg); color: var(--change-text); font-weight: 700; }}
 tr.ins .old {{ background: var(--blank-bg); color: #64748b; }}
