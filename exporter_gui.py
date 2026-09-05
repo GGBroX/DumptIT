@@ -40,6 +40,21 @@ TIMESTAMP_FORMAT = "%Y-%m-%d_%H%M%S"
 TIMESTAMP_STEM_RE = re.compile(r"^(?P<base>.+)_\d{4}-\d{2}-\d{2}_\d{6}$")
 DEFAULT_TIMESTAMP_KEEP_OLD = "10"
 
+EXPORT_FORMAT_STANDARD = "standard"
+EXPORT_FORMAT_LLM = "llm"
+EXPORT_FORMAT_VALUES = (EXPORT_FORMAT_STANDARD, EXPORT_FORMAT_LLM)
+DEFAULT_EXPORT_FORMAT = EXPORT_FORMAT_STANDARD
+LLM_OUTPUT_SUFFIX = "_LLM"
+
+
+def normalize_export_format(value: str, *, strict: bool = False) -> str:
+    normalized = str(value or DEFAULT_EXPORT_FORMAT).strip().lower()
+    if normalized in EXPORT_FORMAT_VALUES:
+        return normalized
+    if strict:
+        raise ValueError(f"Unsupported export format: {value!r}")
+    return DEFAULT_EXPORT_FORMAT
+
 
 LIGHT_THEME_COLORS = {
     "bg": "#f0f0f0",
@@ -2470,9 +2485,33 @@ def add_timestamp_to_output_path(path: Path, now: datetime | None = None) -> Pat
     return base.with_name(f"{base.stem}_{ts}{base.suffix}")
 
 
-def resolve_export_output_path(root: Path, raw_output_file: str, add_timestamp: bool) -> Path:
+def apply_export_format_output_suffix(path: Path, export_format: str) -> Path:
+    normalized = normalize_export_format(export_format, strict=True)
+    if normalized == EXPORT_FORMAT_STANDARD:
+        return path
+
+    match = TIMESTAMP_STEM_RE.match(path.stem or "")
+    if match:
+        base_stem = match.group("base")
+        timestamp_suffix = path.stem[len(base_stem):]
+    else:
+        base_stem = path.stem
+        timestamp_suffix = ""
+
+    if base_stem.lower().endswith(LLM_OUTPUT_SUFFIX.lower()):
+        return path
+    return path.with_name(f"{base_stem}{LLM_OUTPUT_SUFFIX}{timestamp_suffix}{path.suffix}")
+
+
+def resolve_export_output_path(
+    root: Path,
+    raw_output_file: str,
+    add_timestamp: bool,
+    export_format: str = DEFAULT_EXPORT_FORMAT,
+) -> Path:
     raw_output_file = normalize_ui_path(raw_output_file or "")
     base_path = Path(raw_output_file).resolve() if raw_output_file else build_default_output(root, False)
+    base_path = apply_export_format_output_suffix(base_path, export_format)
     if add_timestamp:
         return add_timestamp_to_output_path(base_path)
     return base_path
@@ -2507,12 +2546,24 @@ def collect_timestamped_output_files(path: Path) -> list[Path]:
     return files
 
 
+def _output_format_variant_bases(out_path: Path) -> tuple[Path, Path]:
+    base = get_output_base_path(out_path)
+    if base.stem.lower().endswith(LLM_OUTPUT_SUFFIX.lower()):
+        other_stem = base.stem[:-len(LLM_OUTPUT_SUFFIX)]
+    else:
+        other_stem = f"{base.stem}{LLM_OUTPUT_SUFFIX}"
+    other = base.with_name(f"{other_stem}{base.suffix}")
+    return base, other
+
+
 def build_output_exclude_files(out_path: Path, add_timestamp: bool) -> set[str]:
-    exclude_files = {canon_path(out_path)}
+    base, other_base = _output_format_variant_bases(out_path)
+    exclude_files = {canon_path(out_path), canon_path(base), canon_path(other_base)}
     if add_timestamp:
-        base = get_output_base_path(out_path)
-        exclude_files.add(canon_path(base))
-        exclude_files.update(canon_path(path) for path in collect_timestamped_output_files(base))
+        for candidate_base in (base, other_base):
+            exclude_files.update(
+                canon_path(path) for path in collect_timestamped_output_files(candidate_base)
+            )
     return exclude_files
 
 
@@ -2667,6 +2718,35 @@ def build_project_tree(entries: list[ExportFileEntry]) -> str:
     return "\n".join(lines)
 
 
+def build_llm_project_tree(entries: list[ExportFileEntry]) -> str:
+    tree: dict[str, dict] = {}
+
+    for entry in entries:
+        parts = entry.rel_path.split("/")
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part + "/", {})
+        node[parts[-1]] = entry
+
+    lines: list[str] = []
+
+    def walk(node: dict[str, dict | ExportFileEntry], depth: int) -> None:
+        names = sorted(node.keys(), key=lambda name: (0 if name.endswith("/") else 1, name.lower()))
+        for name in names:
+            value = node[name]
+            indent = "  " * depth
+            if isinstance(value, ExportFileEntry):
+                lines.append(
+                    f"{indent}{name} [{value.stable_id} | {value.line_count} lines | {value.byte_count} bytes]"
+                )
+            else:
+                lines.append(f"{indent}{name}")
+                walk(value, depth + 1)
+
+    walk(tree, 0)
+    return "\n".join(lines)
+
+
 def render_export_text(
     root: Path,
     out_path: Path,
@@ -2705,6 +2785,67 @@ def render_export_text(
     return "".join(parts)
 
 
+def build_llm_file_index(entries: list[ExportFileEntry]) -> str:
+    lines: list[str] = []
+    for entry in entries:
+        lines.append(
+            f"{entry.stable_id} | {entry.rel_path} | ext={entry.extension} | "
+            f"bytes={entry.byte_count} | lines={entry.line_count} | sha256={entry.content_sha256}"
+        )
+    return "\n".join(lines)
+
+
+def render_llm_export_text(
+    root: Path,
+    out_path: Path,
+    profile_name: str,
+    entries: list[ExportFileEntry],
+) -> str:
+    parts: list[str] = []
+    timestamp_utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    project_tree = build_llm_project_tree(entries)
+    file_index = build_llm_file_index(entries)
+
+    parts.append("===== DUMPIT EXPORT =====\n")
+    parts.append("format_version: 2\n")
+    parts.append("export_format: llm\n")
+    parts.append(f"timestamp_utc: {timestamp_utc}\n")
+    parts.append(f"root: {root}\n")
+    parts.append(f"output: {out_path}\n")
+    parts.append(f"profile: {profile_name}\n")
+    parts.append(f"files_included: {len(entries)}\n")
+    parts.append("\n")
+
+    parts.append("===== PROJECT TREE =====\n")
+    if project_tree:
+        parts.append(project_tree)
+        parts.append("\n")
+    else:
+        parts.append("[[NO FILES INCLUDED]]\n")
+    parts.append("\n")
+
+    parts.append("===== FILE INDEX =====\n")
+    if file_index:
+        parts.append(file_index)
+        parts.append("\n")
+    else:
+        parts.append("[[NO FILES INCLUDED]]\n")
+    parts.append("\n")
+
+    for entry in entries:
+        parts.append(
+            f"===== FILE: {entry.header_path} | lines={entry.line_count} | "
+            f"id={entry.stable_id} | bytes={entry.byte_count} | sha256={entry.content_sha256} | "
+            f"modified={entry.modified_at} =====\n"
+        )
+        parts.append(entry.text)
+        if not parts[-1].endswith("\n"):
+            parts.append("\n")
+        parts.append("\n")
+
+    return "".join(parts)
+
+
 def export_to_file(
     root: Path,
     out_path: Path,
@@ -2714,6 +2855,7 @@ def export_to_file(
     header_full_path: bool,
     profile_name: str = "Default",
     exclude_files: Optional[Set[str]] = None,
+    export_format: str = DEFAULT_EXPORT_FORMAT,
 ) -> tuple[int, int]:
     if exclude_files is None:
         exclude_files = {canon_path(out_path)}
@@ -2729,12 +2871,21 @@ def export_to_file(
         exclude_files=exclude_files,
     )
 
-    content = render_export_text(
-        root=root,
-        out_path=out_path,
-        profile_name=profile_name,
-        entries=entries,
-    )
+    normalized_export_format = normalize_export_format(export_format, strict=True)
+    if normalized_export_format == "standard":
+        content = render_export_text(
+            root=root,
+            out_path=out_path,
+            profile_name=profile_name,
+            entries=entries,
+        )
+    elif normalized_export_format == "llm":
+        content = render_llm_export_text(
+            root=root,
+            out_path=out_path,
+            profile_name=profile_name,
+            entries=entries,
+        )
 
     ensure_parent_dir(out_path)
     out_path.write_text(content, encoding="utf-8")
@@ -3613,6 +3764,7 @@ class DumpItApp(tk.Tk):
         self.timestamp_keep_old = tk.StringVar(value=DEFAULT_TIMESTAMP_KEEP_OLD)
         self.skip_binary = tk.BooleanVar(value=True)
         self.header_full_path = tk.BooleanVar(value=False)
+        self.export_format = tk.StringVar(value=DEFAULT_EXPORT_FORMAT)
         self.output_file = tk.StringVar(value="")
 
         # Profiles
@@ -3955,6 +4107,14 @@ class DumpItApp(tk.Tk):
         ttk.Entry(options, textvariable=self.timestamp_keep_old, width=7).grid(row=0, column=2, sticky="w", padx=(0, 6), pady=1)
         ttk.Checkbutton(options, text="Skip binary", variable=self.skip_binary).grid(row=0, column=3, sticky="w", padx=3, pady=1)
         ttk.Checkbutton(options, text="Full path header", variable=self.header_full_path).grid(row=0, column=4, sticky="w", padx=3, pady=1)
+        ttk.Label(options, text="Export format").grid(row=1, column=0, sticky="w", padx=3, pady=1)
+        ttk.Combobox(
+            options,
+            textvariable=self.export_format,
+            values=EXPORT_FORMAT_VALUES,
+            state="readonly",
+            width=12,
+        ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(0, 6), pady=1)
 
         actions = ttk.Frame(export_root)
         actions.pack(fill="x", padx=4, pady=(4, 0))
@@ -4099,7 +4259,12 @@ class DumpItApp(tk.Tk):
             patterns = normalize_patterns(parse_csv_list(self.include_patterns.get()))
             exclude = {x.lower() for x in parse_csv_list(self.exclude_dirs.get())}
             out = normalize_ui_path(self.output_file.get().strip())
-            out_path = resolve_export_output_path(root, out, self.add_timestamp.get())
+            out_path = resolve_export_output_path(
+                root,
+                out,
+                self.add_timestamp.get(),
+                normalize_export_format(self.export_format.get(), strict=True),
+            )
             exclude_files = build_output_exclude_files(out_path, self.add_timestamp.get())
             files = collect_files(root, exclude, patterns, self.skip_binary.get(), exclude_files=exclude_files)
             self._log(f"Preview: {len(files)} files will be included from: {root}")
@@ -4230,6 +4395,7 @@ class DumpItApp(tk.Tk):
                 "timestamp_keep_old": DEFAULT_TIMESTAMP_KEEP_OLD,
                 "skip_binary": "True",
                 "header_full_path": "False",
+                "export_format": DEFAULT_EXPORT_FORMAT,
                 "import_dump_file": "",
                 "import_target_dir": "",
                 "import_overwrite": "True",
@@ -4297,6 +4463,7 @@ class DumpItApp(tk.Tk):
                 "timestamp_keep_old": DEFAULT_TIMESTAMP_KEEP_OLD,
                 "skip_binary": "True",
                 "header_full_path": "False",
+                "export_format": DEFAULT_EXPORT_FORMAT,
                 "import_dump_file": "",
                 "import_target_dir": "",
                 "import_overwrite": "True",
@@ -4324,6 +4491,7 @@ class DumpItApp(tk.Tk):
             self.timestamp_keep_old.set(s.get("timestamp_keep_old", DEFAULT_TIMESTAMP_KEEP_OLD))
             self.skip_binary.set(s.getboolean("skip_binary", fallback=True))
             self.header_full_path.set(s.getboolean("header_full_path", fallback=False))
+            self.export_format.set(normalize_export_format(s.get("export_format", DEFAULT_EXPORT_FORMAT)))
 
             self.output_file.set(normalize_ui_path(s.get("output_file", "")))
             self.import_dump_file.set(normalize_ui_path(s.get("import_dump_file", "")))
@@ -4369,6 +4537,7 @@ class DumpItApp(tk.Tk):
         self._cp[sec_real]["timestamp_keep_old"] = self.timestamp_keep_old.get().strip() or DEFAULT_TIMESTAMP_KEEP_OLD
         self._cp[sec_real]["skip_binary"] = str(self.skip_binary.get())
         self._cp[sec_real]["header_full_path"] = str(self.header_full_path.get())
+        self._cp[sec_real]["export_format"] = normalize_export_format(self.export_format.get())
         self._cp[sec_real]["watch_poll_ms"] = self.watch_poll_ms.get().strip()
         self._cp[sec_real]["watch_quiet_ms"] = self.watch_quiet_ms.get().strip()
         self._cp[sec_real]["watch_export_on_start"] = str(self.watch_export_on_start.get())
@@ -4552,6 +4721,7 @@ class DumpItApp(tk.Tk):
         self.timestamp_keep_old.set(DEFAULT_TIMESTAMP_KEEP_OLD)
         self.skip_binary.set(True)
         self.header_full_path.set(False)
+        self.export_format.set(DEFAULT_EXPORT_FORMAT)
         self.output_file.set("")
         self.import_dump_file.set("")
         self.import_target_dir.set(normalize_ui_path(self.project_dir.get()))
@@ -5628,7 +5798,12 @@ class DumpItApp(tk.Tk):
         add_timestamp = self.add_timestamp.get()
         keep_old = self._parse_timestamp_keep_old()
         out = normalize_ui_path(self.output_file.get().strip())
-        out_path = resolve_export_output_path(root, out, add_timestamp)
+        out_path = resolve_export_output_path(
+            root,
+            out,
+            add_timestamp,
+            normalize_export_format(self.export_format.get(), strict=True),
+        )
         return root, out_path, patterns, exclude_dirs, self.skip_binary.get(), self.header_full_path.get(), add_timestamp, keep_old
 
     def _file_digest(self, p: Path) -> str:
@@ -5848,7 +6023,8 @@ class DumpItApp(tk.Tk):
         keep_old = self._parse_timestamp_keep_old()
 
         out = normalize_ui_path(self.output_file.get().strip())
-        out_path = resolve_export_output_path(root, out, add_timestamp)
+        export_format = normalize_export_format(self.export_format.get(), strict=True)
+        out_path = resolve_export_output_path(root, out, add_timestamp, export_format)
         exclude_files = build_output_exclude_files(out_path, add_timestamp)
 
         included, skipped = export_to_file(
@@ -5860,6 +6036,7 @@ class DumpItApp(tk.Tk):
             header_full_path=self.header_full_path.get(),
             profile_name=(self.profile_name.get().strip() or "Default"),
             exclude_files=exclude_files,
+            export_format=export_format,
         )
 
         deleted_old = 0
@@ -6045,11 +6222,12 @@ class DumpItApp(tk.Tk):
         keep_old = parse_timestamp_keep_old_value(s.get("timestamp_keep_old", DEFAULT_TIMESTAMP_KEEP_OLD))
         skip_binary = s.getboolean("skip_binary", fallback=True)
         header_full_path = s.getboolean("header_full_path", fallback=False)
+        export_format = normalize_export_format(s.get("export_format", DEFAULT_EXPORT_FORMAT))
 
         out_str = normalize_ui_path(s.get("output_file", "").strip())
-        out_path = resolve_export_output_path(root, out_str, add_timestamp)
+        out_path = resolve_export_output_path(root, out_str, add_timestamp, export_format)
 
-        return root, out_path, include_patterns, exclude_dirs, skip_binary, header_full_path, add_timestamp, keep_old
+        return root, out_path, include_patterns, exclude_dirs, skip_binary, header_full_path, add_timestamp, keep_old, export_format
 
     def _set_batch_running(self, running: bool) -> None:
         try:
@@ -6097,7 +6275,7 @@ class DumpItApp(tk.Tk):
         self.lbl_batch_status.configure(text=f"Running {self._batch_mode}: {done}/{done + len(self._batch_queue)}")
 
         try:
-            root, out_path, patterns, exclude_dirs, skip_binary, header_full_path, add_timestamp, keep_old = self._read_profile_settings(name)
+            root, out_path, patterns, exclude_dirs, skip_binary, header_full_path, add_timestamp, keep_old, export_format = self._read_profile_settings(name)
             if not root.exists():
                 raise FileNotFoundError(f"Project folder does not exist: {root}")
 
@@ -6115,6 +6293,7 @@ class DumpItApp(tk.Tk):
                     header_full_path=header_full_path,
                     profile_name=name,
                     exclude_files=build_output_exclude_files(out_path, add_timestamp),
+                    export_format=export_format,
                 )
                 cleanup_msg = ""
                 if add_timestamp:
