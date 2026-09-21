@@ -1144,6 +1144,8 @@ DUMPIT_PATCH_STATUS_APPLICABLE_EXACT_OFFSET = "APPLICABLE_EXACT_OFFSET"
 DUMPIT_PATCH_STATUS_APPLICABLE_EXACT_OFFSET_EOF_CONTEXT = "APPLICABLE_EXACT_OFFSET_EOF_CONTEXT"
 DUMPIT_PATCH_STATUS_APPLICABLE_RELOCATED = "APPLICABLE_RELOCATED"
 DUMPIT_PATCH_STATUS_APPLICABLE_RELOCATED_EOF_CONTEXT = "APPLICABLE_RELOCATED_EOF_CONTEXT"
+DUMPIT_PATCH_STATUS_APPLICABLE_CONTEXT_FUZZY = "APPLICABLE_CONTEXT_FUZZY"
+DUMPIT_PATCH_STATUS_APPLICABLE_FUZZY_POSITIONAL = "APPLICABLE_FUZZY_POSITIONAL"
 DUMPIT_PATCH_STATUS_ALREADY_APPLIED = "ALREADY_APPLIED"
 DUMPIT_PATCH_STATUS_FAILED_NOT_FOUND = "FAILED_NOT_FOUND"
 DUMPIT_PATCH_STATUS_FAILED_AMBIGUOUS = "FAILED_AMBIGUOUS"
@@ -1368,6 +1370,20 @@ def _effective_hunk_blocks(hunk: UnifiedPatchHunk, *, reverse: bool) -> tuple[in
     return int(hunk.old_start), _hunk_old_lines(hunk), _hunk_new_lines(hunk)
 
 
+def _effective_hunk_lines(hunk: UnifiedPatchHunk, *, reverse: bool) -> tuple[str, ...]:
+    if not reverse:
+        return tuple(hunk.lines)
+    out: list[str] = []
+    for line in hunk.lines:
+        if line.startswith("+"):
+            out.append("-" + line[1:])
+        elif line.startswith("-"):
+            out.append("+" + line[1:])
+        else:
+            out.append(line)
+    return tuple(out)
+
+
 def _effective_patch_paths(patch_file: UnifiedPatchFile, *, reverse: bool) -> tuple[str, str, str, bool, bool]:
     effective_old = patch_file.new_path if reverse else patch_file.old_path
     effective_new = patch_file.old_path if reverse else patch_file.new_path
@@ -1425,15 +1441,31 @@ def _render_dumpit_patch_lines(lines: list[str], *, newline: str, final_newline:
     return text
 
 
+def _normalize_dumpit_match_line(line: str) -> str:
+    """Normalize only whitespace that is irrelevant to hunk identity.
+
+    Newline differences are already removed by ``splitlines()`` while loading
+    the target and the patch. Matching additionally ignores trailing spaces
+    and tabs without weakening leading indentation or internal whitespace.
+    """
+    return str(line).rstrip(" \t")
+
+
+def _normalized_dumpit_match_block(block: list[str]) -> list[str]:
+    return [_normalize_dumpit_match_line(line) for line in block]
+
+
 def _find_exact_block(lines: list[str], block: list[str]) -> list[int]:
     if not block:
         return []
     size = len(block)
     if size > len(lines):
         return []
+    normalized_block = _normalized_dumpit_match_block(block)
     out: list[int] = []
     for idx in range(0, len(lines) - size + 1):
-        if lines[idx:idx + size] == block:
+        candidate = lines[idx:idx + size]
+        if candidate == block or _normalized_dumpit_match_block(candidate) == normalized_block:
             out.append(idx)
     return out
 
@@ -1444,9 +1476,77 @@ def _match_block_at_line(lines: list[str], start_line: int, block: list[str]) ->
         if idx <= len(lines):
             return idx
         return None
-    if idx + len(block) <= len(lines) and lines[idx:idx + len(block)] == block:
+    if idx + len(block) > len(lines):
+        return None
+    candidate = lines[idx:idx + len(block)]
+    if candidate == block:
+        return idx
+    if _normalized_dumpit_match_block(candidate) == _normalized_dumpit_match_block(block):
         return idx
     return None
+
+
+def _dumpit_patch_newline_label(newline: str) -> str:
+    if newline == "\r\n":
+        return "CRLF"
+    if newline == "\r":
+        return "CR"
+    return "LF"
+
+
+def _dumpit_patch_best_candidate(lines: list[str], block: list[str]) -> tuple[int | None, float]:
+    if not block or not lines:
+        return None, 0.0
+    size = len(block)
+    normalized_block = _normalized_dumpit_match_block(block)
+    starts = range(0, max(1, len(lines) - size + 1))
+    best_idx: int | None = None
+    best_score = -1.0
+    for idx in starts:
+        candidate = lines[idx:idx + size]
+        normalized_candidate = _normalized_dumpit_match_block(candidate)
+        score = difflib.SequenceMatcher(None, normalized_block, normalized_candidate).ratio()
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+    if best_idx is None:
+        return None, 0.0
+    return best_idx, max(0.0, best_score)
+
+
+def _dumpit_patch_block_excerpt(block: list[str], *, head: bool) -> str:
+    sample = block[:3] if head else block[-3:]
+    return repr(sample)
+
+
+def _dumpit_patch_not_found_detail(
+    *,
+    lines: list[str],
+    start_line: int,
+    old_block: list[str],
+    newline: str,
+    encoding: str,
+) -> str:
+    best_idx, similarity = _dumpit_patch_best_candidate(lines, old_block)
+    candidate_text = "none" if best_idx is None else str(best_idx + 1)
+    if best_idx is None:
+        candidate: list[str] = []
+    else:
+        candidate = lines[best_idx:best_idx + len(old_block)]
+    bom = "yes" if str(encoding).lower().endswith("-sig") else "no"
+    mismatch = "no_candidate" if best_idx is None else "text_different"
+    return (
+        "neither old block nor new block was found; "
+        f"expected_start={max(1, int(start_line or 1))}; "
+        f"newline={_dumpit_patch_newline_label(newline)}; "
+        f"encoding={encoding}; bom={bom}; "
+        f"old_head={_dumpit_patch_block_excerpt(old_block, head=True)}; "
+        f"old_tail={_dumpit_patch_block_excerpt(old_block, head=False)}; "
+        f"best_candidate_start={candidate_text}; similarity={similarity:.3f}; "
+        f"candidate_head={_dumpit_patch_block_excerpt(candidate, head=True)}; "
+        f"candidate_tail={_dumpit_patch_block_excerpt(candidate, head=False)}; "
+        f"mismatch={mismatch}"
+    )
 
 
 def _trim_single_trailing_empty_context(old_block: list[str], new_block: list[str]) -> tuple[list[str], list[str]] | None:
@@ -1473,6 +1573,296 @@ def _find_unique_eof_context_block(lines: list[str], block: list[str]) -> int | 
     if idx + len(block) != len(lines):
         return None
     return idx
+
+
+DUMPIT_PATCH_CONTEXT_REMOVED_MIN_SIMILARITY = 0.95
+DUMPIT_PATCH_CONTEXT_BLOCK_MIN_SIMILARITY = 0.92
+DUMPIT_PATCH_FUZZY_MIN_LINE_SIMILARITY = 0.90
+DUMPIT_PATCH_FUZZY_MIN_BLOCK_SIMILARITY = 0.95
+DUMPIT_PATCH_FUZZY_RADIUS = 80
+DUMPIT_PATCH_FUZZY_MIN_BLOCK_LINES = 3
+
+
+def _dumpit_patch_line_similarity(expected: str, actual: str) -> float:
+    expected_norm = _normalize_dumpit_match_line(expected)
+    actual_norm = _normalize_dumpit_match_line(actual)
+    if expected_norm == actual_norm:
+        return 1.0
+    return difflib.SequenceMatcher(None, expected_norm, actual_norm).ratio()
+
+
+def _dumpit_patch_is_minor_line_drift(
+    expected: str,
+    actual: str,
+    *,
+    min_similarity: float,
+) -> bool:
+    """Allow typo-scale drift, not alternate wording with similar long context.
+
+    Character similarity alone is unsafe on long prose because inserting an
+    entire semantic clause can still yield a very high ratio. The fallback is
+    therefore limited to at most four changed characters across at most two
+    edit regions after trailing-whitespace normalization.
+    """
+    expected_norm = _normalize_dumpit_match_line(expected)
+    actual_norm = _normalize_dumpit_match_line(actual)
+    if expected_norm == actual_norm:
+        return True
+    matcher = difflib.SequenceMatcher(None, expected_norm, actual_norm)
+    if matcher.ratio() < min_similarity:
+        return False
+    changed_regions = 0
+    changed_chars = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        changed_regions += 1
+        changed_chars += (i2 - i1) + (j2 - j1)
+    return changed_regions <= 2 and changed_chars <= 4
+
+
+def _dumpit_patch_old_line_roles(hunk_lines: tuple[str, ...]) -> list[str]:
+    roles: list[str] = []
+    for line in hunk_lines:
+        if not line or line.startswith("\\ No newline at end of file"):
+            continue
+        if line[0] == " ":
+            roles.append("context")
+        elif line[0] == "-":
+            roles.append("removed")
+    return roles
+
+
+def _dumpit_patch_apply_hunk_to_candidate(
+    candidate: list[str],
+    hunk_lines: tuple[str, ...],
+) -> list[str] | None:
+    """Apply one effective hunk while preserving matched target context lines.
+
+    Fuzzy matching is allowed to identify a candidate, but context text from the
+    patch must not overwrite harmless target-side drift. Removed lines are
+    consumed, added lines come from the patch, and unchanged context is copied
+    from the actual target candidate.
+    """
+    out: list[str] = []
+    old_idx = 0
+    for line in hunk_lines:
+        if not line or line.startswith("\\ No newline at end of file"):
+            continue
+        prefix = line[0]
+        if prefix == " ":
+            if old_idx >= len(candidate):
+                return None
+            out.append(candidate[old_idx])
+            old_idx += 1
+        elif prefix == "-":
+            if old_idx >= len(candidate):
+                return None
+            old_idx += 1
+        elif prefix == "+":
+            out.append(line[1:])
+    if old_idx != len(candidate):
+        return None
+    return out
+
+
+def _dumpit_patch_context_fuzzy_candidates(
+    lines: list[str],
+    old_block: list[str],
+    hunk_lines: tuple[str, ...],
+) -> list[tuple[int, float]]:
+    """Find candidates anchored by exact unchanged context and mild removed-line drift.
+
+    This intentionally does not support insertion-only hunks: if no removed
+    lines exist, content between context anchors may represent a real conflict
+    and must not be overwritten or duplicated automatically.
+    """
+    size = len(old_block)
+    roles = _dumpit_patch_old_line_roles(hunk_lines)
+    if size < 2 or len(roles) != size:
+        return []
+    context_offsets = [idx for idx, role in enumerate(roles) if role == "context"]
+    removed_offsets = [idx for idx, role in enumerate(roles) if role == "removed"]
+    if not context_offsets or not removed_offsets or size > len(lines):
+        return []
+
+    normalized_old = _normalized_dumpit_match_block(old_block)
+    out: list[tuple[int, float]] = []
+    for idx in range(0, len(lines) - size + 1):
+        candidate = lines[idx:idx + size]
+        normalized_candidate = _normalized_dumpit_match_block(candidate)
+        if any(normalized_candidate[offset] != normalized_old[offset] for offset in context_offsets):
+            continue
+        removed_scores = [
+            _dumpit_patch_line_similarity(old_block[offset], candidate[offset])
+            for offset in removed_offsets
+        ]
+        if not removed_scores or min(removed_scores) < DUMPIT_PATCH_CONTEXT_REMOVED_MIN_SIMILARITY:
+            continue
+        if any(
+            not _dumpit_patch_is_minor_line_drift(
+                old_block[offset],
+                candidate[offset],
+                min_similarity=DUMPIT_PATCH_CONTEXT_REMOVED_MIN_SIMILARITY,
+            )
+            for offset in removed_offsets
+        ):
+            continue
+        all_scores = [
+            _dumpit_patch_line_similarity(expected, actual)
+            for expected, actual in zip(old_block, candidate)
+        ]
+        score = sum(all_scores) / len(all_scores)
+        if score < DUMPIT_PATCH_CONTEXT_BLOCK_MIN_SIMILARITY:
+            continue
+        if all(value == 1.0 for value in all_scores):
+            continue
+        out.append((idx, score))
+    return out
+
+
+def _dumpit_patch_positional_fuzzy_candidates(
+    lines: list[str],
+    old_block: list[str],
+    *,
+    start_line: int,
+) -> list[tuple[int, float]]:
+    """Find high-confidence fixed-size candidates near the hunk coordinate.
+
+    Positional fuzzy matching is deliberately narrow: blocks must contain at
+    least three old-side lines, at least half of them must still match exactly,
+    every line must remain highly similar, and the candidate must live within a
+    bounded window around the original hunk coordinate.
+    """
+    size = len(old_block)
+    if size < DUMPIT_PATCH_FUZZY_MIN_BLOCK_LINES or size > len(lines):
+        return []
+    expected_idx = max(0, int(start_line or 1) - 1)
+    first = max(0, expected_idx - DUMPIT_PATCH_FUZZY_RADIUS)
+    last = min(len(lines) - size, expected_idx + DUMPIT_PATCH_FUZZY_RADIUS)
+    if last < first:
+        return []
+
+    required_exact = (size + 1) // 2
+    normalized_old = _normalized_dumpit_match_block(old_block)
+    out: list[tuple[int, float]] = []
+    for idx in range(first, last + 1):
+        candidate = lines[idx:idx + size]
+        normalized_candidate = _normalized_dumpit_match_block(candidate)
+        exact_count = sum(
+            1 for expected, actual in zip(normalized_old, normalized_candidate) if expected == actual
+        )
+        if exact_count < required_exact:
+            continue
+        scores = [
+            _dumpit_patch_line_similarity(expected, actual)
+            for expected, actual in zip(old_block, candidate)
+        ]
+        if min(scores) < DUMPIT_PATCH_FUZZY_MIN_LINE_SIMILARITY:
+            continue
+        if any(
+            normalized_old[offset] != normalized_candidate[offset]
+            and not _dumpit_patch_is_minor_line_drift(
+                old_block[offset],
+                candidate[offset],
+                min_similarity=DUMPIT_PATCH_FUZZY_MIN_LINE_SIMILARITY,
+            )
+            for offset in range(size)
+        ):
+            continue
+        score = sum(scores) / len(scores)
+        if score < DUMPIT_PATCH_FUZZY_MIN_BLOCK_SIMILARITY:
+            continue
+        if all(value == 1.0 for value in scores):
+            continue
+        out.append((idx, score))
+    return out
+
+
+def _resolve_dumpit_safe_fuzzy_fallback(
+    *,
+    rel_path: str,
+    hunk_index: int,
+    lines: list[str],
+    start_line: int,
+    old_block: list[str],
+    hunk_lines: tuple[str, ...],
+) -> tuple[DumpItPatchHunkResult, list[str]] | None:
+    context_candidates = _dumpit_patch_context_fuzzy_candidates(lines, old_block, hunk_lines)
+    if len(context_candidates) > 1:
+        return (
+            DumpItPatchHunkResult(
+                file_path=rel_path,
+                hunk_index=hunk_index,
+                status=DUMPIT_PATCH_STATUS_FAILED_AMBIGUOUS,
+                detail=f"safe context fallback matched {len(context_candidates)} candidates",
+            ),
+            lines,
+        )
+    if len(context_candidates) == 1:
+        idx, score = context_candidates[0]
+        replacement = _dumpit_patch_apply_hunk_to_candidate(
+            lines[idx:idx + len(old_block)],
+            hunk_lines,
+        )
+        if replacement is not None:
+            updated = list(lines)
+            updated[idx:idx + len(old_block)] = replacement
+            return (
+                DumpItPatchHunkResult(
+                    file_path=rel_path,
+                    hunk_index=hunk_index,
+                    status=DUMPIT_PATCH_STATUS_APPLICABLE_CONTEXT_FUZZY,
+                    line_no=idx + 1,
+                    detail=(
+                        "unique context-anchored fallback; "
+                        f"similarity={score:.3f}; removed_line_min={DUMPIT_PATCH_CONTEXT_REMOVED_MIN_SIMILARITY:.2f}"
+                    ),
+                ),
+                updated,
+            )
+
+    positional_candidates = _dumpit_patch_positional_fuzzy_candidates(
+        lines,
+        old_block,
+        start_line=start_line,
+    )
+    if len(positional_candidates) > 1:
+        return (
+            DumpItPatchHunkResult(
+                file_path=rel_path,
+                hunk_index=hunk_index,
+                status=DUMPIT_PATCH_STATUS_FAILED_AMBIGUOUS,
+                detail=(
+                    f"safe positional fuzzy fallback matched {len(positional_candidates)} candidates "
+                    f"within +/-{DUMPIT_PATCH_FUZZY_RADIUS} lines"
+                ),
+            ),
+            lines,
+        )
+    if len(positional_candidates) == 1:
+        idx, score = positional_candidates[0]
+        replacement = _dumpit_patch_apply_hunk_to_candidate(
+            lines[idx:idx + len(old_block)],
+            hunk_lines,
+        )
+        if replacement is not None:
+            updated = list(lines)
+            updated[idx:idx + len(old_block)] = replacement
+            return (
+                DumpItPatchHunkResult(
+                    file_path=rel_path,
+                    hunk_index=hunk_index,
+                    status=DUMPIT_PATCH_STATUS_APPLICABLE_FUZZY_POSITIONAL,
+                    line_no=idx + 1,
+                    detail=(
+                        "unique bounded positional fuzzy fallback; "
+                        f"similarity={score:.3f}; radius={DUMPIT_PATCH_FUZZY_RADIUS}"
+                    ),
+                ),
+                updated,
+            )
+    return None
 
 
 def _already_applied_by_contained_old_block(
@@ -1524,8 +1914,12 @@ def _resolve_dumpit_hunk(
     start_line: int,
     old_block: list[str],
     new_block: list[str],
+    hunk_lines: tuple[str, ...] = (),
     allow_empty_exact: bool = True,
+    allow_fuzzy_fallback: bool = True,
     adjusted_from_line: int | None = None,
+    target_newline: str = "\n",
+    target_encoding: str = "utf-8",
 ) -> tuple[DumpItPatchHunkResult, list[str]]:
     contained_already_applied = _already_applied_by_contained_old_block(
         rel_path=rel_path,
@@ -1671,12 +2065,30 @@ def _resolve_dumpit_hunk(
                 lines,
             )
 
+    if allow_fuzzy_fallback and hunk_lines and old_block:
+        fuzzy_result = _resolve_dumpit_safe_fuzzy_fallback(
+            rel_path=rel_path,
+            hunk_index=hunk_index,
+            lines=lines,
+            start_line=start_line,
+            old_block=old_block,
+            hunk_lines=hunk_lines,
+        )
+        if fuzzy_result is not None:
+            return fuzzy_result
+
     return (
         DumpItPatchHunkResult(
             file_path=rel_path,
             hunk_index=hunk_index,
             status=DUMPIT_PATCH_STATUS_FAILED_NOT_FOUND,
-            detail="neither old block nor new block was found",
+            detail=_dumpit_patch_not_found_detail(
+                lines=lines,
+                start_line=start_line,
+                old_block=old_block,
+                newline=target_newline,
+                encoding=target_encoding,
+            ),
         ),
         lines,
     )
@@ -1840,6 +2252,7 @@ def build_dumpit_patch_plan(
             line_offset = 0
             for hunk_index, hunk in enumerate(patch_file.hunks, start=1):
                 start_line, old_block, new_block = _effective_hunk_blocks(hunk, reverse=reverse)
+                effective_hunk_lines = _effective_hunk_lines(hunk, reverse=reverse)
                 adjusted_start_line = max(1, int(start_line or 1) + int(line_offset))
                 result, updated_lines = _resolve_dumpit_hunk(
                     rel_path=rel,
@@ -1848,8 +2261,12 @@ def build_dumpit_patch_plan(
                     start_line=adjusted_start_line,
                     old_block=old_block,
                     new_block=new_block,
+                    hunk_lines=effective_hunk_lines,
                     allow_empty_exact=bool(is_create or not existed),
+                    allow_fuzzy_fallback=bool(existed and not is_create and not is_delete),
                     adjusted_from_line=start_line if adjusted_start_line != int(start_line or 1) else None,
+                    target_newline=doc.newline,
+                    target_encoding=doc.encoding,
                 )
                 file_hunk_results.append(result)
                 if not result.failed:
