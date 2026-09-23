@@ -1312,36 +1312,84 @@ def parse_unified_patch(patch_path: Path) -> tuple[UnifiedPatchFile, ...]:
             match = DUMPIT_PATCH_HUNK_RE.match(line)
             if not match:
                 raise ValueError(f"Unsupported hunk header: {line}")
+
+            old_count = int(match.group("old_count") or 1)
+            new_count = int(match.group("new_count") or 1)
+            old_seen = 0
+            new_seen = 0
             i += 1
             hunk_lines: list[str] = []
+
+            # Parse by the line counts declared in the @@ header rather than by
+            # delimiter heuristics. Git accepts a physically empty line inside a
+            # hunk as an empty context line (despite the canonical unified-diff
+            # spelling being a single " " prefix). Supporting that representation
+            # is required for compatibility with patches Git can apply.
             while i < len(raw_lines):
                 hunk_line = raw_lines[i]
-                if hunk_line.startswith("@@ "):
-                    break
-                if hunk_line.startswith("diff --git "):
-                    break
-                if hunk_line.startswith("--- ") and i + 1 < len(raw_lines) and raw_lines[i + 1].startswith("+++ "):
-                    break
+
+                # The no-newline marker belongs to the preceding hunk line but
+                # consumes neither the old nor the new side count. It may appear
+                # after the declared counts have just been satisfied.
                 if hunk_line.startswith("\\ No newline at end of file"):
                     hunk_lines.append(hunk_line)
                     i += 1
                     continue
+
+                if old_seen == old_count and new_seen == new_count:
+                    break
+
                 if not hunk_line:
-                    # An empty physical patch line is unusual but can only be a
-                    # malformed hunk line because real empty context/removal/addition
-                    # lines still carry their prefix character.
-                    break
-                if hunk_line[0] not in {" ", "-", "+"}:
-                    break
+                    # Git-compatible leniency: an unprefixed physical blank can
+                    # only be inferred safely as context when both sides still
+                    # require a line. Never guess an empty addition/removal.
+                    if old_seen < old_count and new_seen < new_count:
+                        hunk_lines.append(" ")
+                        old_seen += 1
+                        new_seen += 1
+                        i += 1
+                        continue
+                    raise ValueError(
+                        "Malformed unified diff hunk: physical blank line cannot "
+                        "satisfy only one side of the declared line counts "
+                        f"(old={old_seen}/{old_count}, new={new_seen}/{new_count})"
+                    )
+
+                prefix = hunk_line[0]
+                if prefix not in {" ", "-", "+"}:
+                    raise ValueError(
+                        "Malformed unified diff hunk: encountered a non-hunk line "
+                        "before the declared line counts were satisfied "
+                        f"(old={old_seen}/{old_count}, new={new_seen}/{new_count}): {hunk_line}"
+                    )
+
+                old_inc = 1 if prefix in {" ", "-"} else 0
+                new_inc = 1 if prefix in {" ", "+"} else 0
+                if old_seen + old_inc > old_count or new_seen + new_inc > new_count:
+                    raise ValueError(
+                        "Malformed unified diff hunk: hunk content exceeds declared "
+                        "line counts "
+                        f"(old={old_seen + old_inc}/{old_count}, new={new_seen + new_inc}/{new_count})"
+                    )
+
                 hunk_lines.append(hunk_line)
+                old_seen += old_inc
+                new_seen += new_inc
                 i += 1
+
+            if old_seen != old_count or new_seen != new_count:
+                raise ValueError(
+                    "Malformed unified diff hunk: declared line counts were not "
+                    "satisfied "
+                    f"(old={old_seen}/{old_count}, new={new_seen}/{new_count})"
+                )
 
             current_hunks.append(
                 UnifiedPatchHunk(
                     old_start=int(match.group("old_start") or 0),
-                    old_count=int(match.group("old_count") or 1),
+                    old_count=old_count,
                     new_start=int(match.group("new_start") or 0),
-                    new_count=int(match.group("new_count") or 1),
+                    new_count=new_count,
                     section=(match.group("section") or "").strip(),
                     lines=tuple(hunk_lines),
                 )

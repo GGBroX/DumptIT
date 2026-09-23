@@ -547,3 +547,173 @@ def test_dumpit_safe_context_fallback_rejects_semantic_clause_drift_even_with_hi
     hunk = plan.files[0].hunk_results[0]
     assert hunk.status == e.DUMPIT_PATCH_STATUS_FAILED_NOT_FOUND
     assert "mismatch=text_different" in hunk.detail
+
+
+def test_dumpit_git_compatible_count_driven_parser_accepts_physical_blank_context_lines(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    target = tmp_path / "src" / "specialization_prewarm.rs"
+    lines = [f"filler-{idx}" for idx in range(1, 281)]
+
+    replacements = {
+        189: [
+            "        };",
+            "        let future_entries = future_cache",
+            "            .iter()",
+            "            .map(|(entity, (_tick, pipeline_id))| (*entity, pipeline_id.id()))",
+            "            .collect::<Vec<_>>();",
+            "        snapshots.push(ShadowSpecializationResidualViewSnapshot {",
+            "            cascade_index: usize::try_from(planned.future_view.subview_index)",
+        ],
+        229: [
+            "        let template_cache = shadow_material_cache.get(&snapshot.template_view);",
+            "        let mut view_added = 0usize;",
+            "",
+            "        for (entity, (_tick, after_pipeline_id)) in after_cache.iter() {",
+            "            let after_pipeline_id = after_pipeline_id.id();",
+            "            let before_pipeline_id = snapshot",
+            "                .future_entries",
+        ],
+        253: [
+            "",
+            "            let template_pipeline_id = template_cache",
+            "                .and_then(|cache| cache.get(entity))",
+            "                .map(|(_tick, pipeline_id)| pipeline_id.id());",
+            "            let template_present = template_pipeline_id.is_some();",
+            "            let template_pipeline_same = template_pipeline_id == Some(after_pipeline_id);",
+            "            if change_kind == 1 {",
+        ],
+        271: [
+            "                C8_4D_RESIDUAL_ENTRY_EVENT,",
+            "                c8_4d_residual_entry_values(",
+            "                    snapshot.cascade_index,",
+            "                    entity.id().index(),",
+            "                    change_kind,",
+            "                    template_present,",
+            "                    template_pipeline_same,",
+        ],
+    }
+    for start, block in replacements.items():
+        lines[start - 1 : start - 1 + len(block)] = block
+
+    original_bytes = ("\r\n".join(lines) + "\r\n").encode("utf-8")
+    target.write_bytes(original_bytes)
+
+    patch = tmp_path / "p.patch"
+    _write_patch(
+        patch,
+        """diff --git a/src/specialization_prewarm.rs b/src/specialization_prewarm.rs
+--- a/src/specialization_prewarm.rs
++++ b/src/specialization_prewarm.rs
+@@ -189,7 +189,7 @@
+         };
+         let future_entries = future_cache
+             .iter()
+-            .map(|(entity, (_tick, pipeline_id))| (*entity, pipeline_id.id()))
++            .map(|(entity, (pipeline_id, _draw_function_id))| (*entity, pipeline_id.id()))
+             .collect::<Vec<_>>();
+         snapshots.push(ShadowSpecializationResidualViewSnapshot {
+             cascade_index: usize::try_from(planned.future_view.subview_index)
+@@ -229,7 +229,7 @@
+         let template_cache = shadow_material_cache.get(&snapshot.template_view);
+         let mut view_added = 0usize;
+
+-        for (entity, (_tick, after_pipeline_id)) in after_cache.iter() {
++        for (entity, (after_pipeline_id, _draw_function_id)) in after_cache.iter() {
+             let after_pipeline_id = after_pipeline_id.id();
+             let before_pipeline_id = snapshot
+                 .future_entries
+@@ -253,7 +253,7 @@
+
+             let template_pipeline_id = template_cache
+                 .and_then(|cache| cache.get(entity))
+-                .map(|(_tick, pipeline_id)| pipeline_id.id());
++                .map(|(pipeline_id, _draw_function_id)| pipeline_id.id());
+             let template_present = template_pipeline_id.is_some();
+             let template_pipeline_same = template_pipeline_id == Some(after_pipeline_id);
+             if change_kind == 1 {
+@@ -271,7 +271,7 @@
+                 C8_4D_RESIDUAL_ENTRY_EVENT,
+                 c8_4d_residual_entry_values(
+                     snapshot.cascade_index,
+-                    entity.id().index(),
++                    entity.id().index_u32(),
+                     change_kind,
+                     template_present,
+                     template_pipeline_same,
+""",
+    )
+
+    parsed = e.parse_unified_patch(patch)
+    assert len(parsed) == 1
+    assert len(parsed[0].hunks) == 4
+    assert parsed[0].hunks[1].lines[2] == " "
+    assert parsed[0].hunks[2].lines[0] == " "
+
+    preview_plan = e.build_dumpit_patch_plan(root=tmp_path, patch_path=patch, strip_level=1, reverse=False)
+    assert not preview_plan.failed
+    assert preview_plan.total_hunks == 4
+    assert all(not h.failed for h in preview_plan.files[0].hunk_results)
+
+    apply_plan = e.build_dumpit_patch_plan(root=tmp_path, patch_path=patch, strip_level=1, reverse=False)
+    assert apply_plan.files[0].hunk_results == preview_plan.files[0].hunk_results
+    e.execute_dumpit_patch_plan(apply_plan)
+    assert target.read_bytes().count(b"\r\n") == 280
+    applied_text = target.read_text(encoding="utf-8")
+    assert ".map(|(entity, (pipeline_id, _draw_function_id))| (*entity, pipeline_id.id()))" in applied_text
+    assert "for (entity, (after_pipeline_id, _draw_function_id)) in after_cache.iter()" in applied_text
+    assert ".map(|(pipeline_id, _draw_function_id)| pipeline_id.id());" in applied_text
+    assert "entity.id().index_u32()," in applied_text
+
+    already_plan = e.build_dumpit_patch_plan(root=tmp_path, patch_path=patch, strip_level=1, reverse=False)
+    assert not already_plan.failed
+    assert all(
+        h.status == e.DUMPIT_PATCH_STATUS_ALREADY_APPLIED
+        for h in already_plan.files[0].hunk_results
+    )
+
+    reverse_plan = e.build_dumpit_patch_plan(root=tmp_path, patch_path=patch, strip_level=1, reverse=True)
+    assert not reverse_plan.failed
+    e.execute_dumpit_patch_plan(reverse_plan)
+    assert target.read_bytes() == original_bytes
+
+
+def test_dumpit_count_driven_parser_rejects_truncated_hunk_instead_of_silently_parsing_it(tmp_path: Path) -> None:
+    patch = tmp_path / "p.patch"
+    _write_patch(
+        patch,
+        """diff --git a/src/x.txt b/src/x.txt
+--- a/src/x.txt
++++ b/src/x.txt
+@@ -1,3 +1,3 @@
+ a
+-b
++B
+""",
+    )
+
+    try:
+        e.parse_unified_patch(patch)
+    except ValueError as exc:
+        assert "declared line counts were not satisfied" in str(exc)
+    else:
+        raise AssertionError("expected truncated hunk to be rejected")
+
+
+def test_dumpit_count_driven_parser_does_not_guess_unprefixed_blank_as_one_sided_change(tmp_path: Path) -> None:
+    patch = tmp_path / "p.patch"
+    patch.write_text(
+        "diff --git a/src/x.txt b/src/x.txt\n"
+        "--- a/src/x.txt\n"
+        "+++ b/src/x.txt\n"
+        "@@ -1,0 +1,1 @@\n"
+        "\n",
+        encoding="utf-8",
+        newline="",
+    )
+
+    try:
+        e.parse_unified_patch(patch)
+    except ValueError as exc:
+        assert "physical blank line cannot satisfy only one side" in str(exc)
+    else:
+        raise AssertionError("expected ambiguous physical blank to be rejected")
