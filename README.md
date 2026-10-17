@@ -44,6 +44,50 @@ The `llm` mode does not compress or rewrite source. It adds deterministic metada
 
 ---
 
+## October 2026 addendum — lossless XZ dump transport
+
+The Export tab now has two independent settings, persisted per profile:
+
+```text
+Export format       standard | llm
+Compression         none | xz     (default: none for legacy profiles)
+XZ level            0 .. 9        (default: 6)
+```
+
+This is an **envelope**, not a new dump format. Both `standard` and `llm`
+produce exactly the same logical file sections as before. With XZ enabled the
+whole UTF-8 dump is compressed using Python's standard-library `lzma` and saved
+as `.txt.xz` (or `<chosen extension>.xz`). For example:
+
+```text
+TradingTool_LLM_2026-10-17_093222.txt.xz
+```
+
+The `_LLM` suffix and timestamp precede `.txt.xz`. Export Preview, manual
+Export, Watch, and Batch use the shared output resolver. Batch uses saved profile
+compression and level settings; Watch uses current profile settings through the
+normal export path. Timestamp cleanup retains only the configured count of
+archives within the selected output family. The output scanner excludes both
+compressed and uncompressed Standard/LLM sibling outputs to prevent accidental
+self-inclusion.
+
+Compressed exports are written to a temporary file in the destination directory
+and published with `os.replace()` only after writing succeeds. An interrupted
+compression cannot overwrite a previously completed archive. A temporary archive
+is removed on failure.
+
+Import and Diff autodetect `.xz` and decompress before using the existing dump
+parser. Plain `.txt`/`.dump` remains supported. Invalid/corrupted compressed
+archives cause an explicit error. Decompressed input is bounded to 1 GiB in the
+current materializing Import/Diff implementation.
+
+Compression is lossless, but does **not** reduce LLM token use when the entire
+uncompressed source must be supplied to a model. It reduces storage and upload
+size. Existing `.patch` workflows, patch receipts and source patch application
+are unchanged.
+
+---
+
 # 2. Startup and Build
 
 ## 2.1 Running from source
