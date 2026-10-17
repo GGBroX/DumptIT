@@ -44,47 +44,53 @@ The `llm` mode does not compress or rewrite source. It adds deterministic metada
 
 ---
 
-## October 2026 addendum — lossless XZ dump transport
+## October 2026 addendum — lossless ZIP dump transport
 
-The Export tab now has two independent settings, persisted per profile:
+The Export tab has two independent settings persisted per profile:
 
 ```text
 Export format       standard | llm
-Compression         none | xz     (default: none for legacy profiles)
-XZ level            0 .. 9        (default: 6)
+Compression         none | zip    (default: none for legacy uncompressed profiles)
+ZIP level           0 .. 9       (default: 6)
 ```
 
-This is an **envelope**, not a new dump format. Both `standard` and `llm`
-produce exactly the same logical file sections as before. With XZ enabled the
-whole UTF-8 dump is compressed using Python's standard-library `lzma` and saved
-as `.txt.xz` (or `<chosen extension>.xz`). For example:
+With ZIP enabled, DumpIt writes a single-member `.txt.zip` file (or
+`<chosen extension>.zip`). The member is the original UTF-8 textual dump,
+with its original filename, generated in the unchanged `standard` or `llm`
+logical format. Example:
 
 ```text
-TradingTool_LLM_2026-10-17_093222.txt.xz
+TradingTool_LLM_2026-10-17_093222.txt.zip
+  └─ TradingTool_LLM_2026-10-17_093222.txt
 ```
 
-The `_LLM` suffix and timestamp precede `.txt.xz`. Export Preview, manual
-Export, Watch, and Batch use the shared output resolver. Batch uses saved profile
-compression and level settings; Watch uses current profile settings through the
-normal export path. Timestamp cleanup retains only the configured count of
-archives within the selected output family. The output scanner excludes both
-compressed and uncompressed Standard/LLM sibling outputs to prevent accidental
-self-inclusion.
+Compression uses Python standard-library `zipfile` with DEFLATE, level 6 by
+default, with no external utilities. Archives can also be inspected by Windows
+Explorer. ZIP output is published atomically: failure leaves an existing
+archive untouched and removes the incomplete temporary file.
 
-Compressed exports are written to a temporary file in the destination directory
-and published with `os.replace()` only after writing succeeds. An interrupted
-compression cannot overwrite a previously completed archive. A temporary archive
-is removed on failure.
+Export, Watch and Batch use the same output resolver; Batch reads the saved
+profile's compression settings. Timestamp retention applies to the chosen
+output family, without deleting earlier archives of other formats. Export
+scanning excludes `.txt`, `.txt.zip`, `.txt.xz` and their Standard/LLM or
+timestamped siblings so historical outputs cannot be included by accident.
 
-Import and Diff autodetect `.xz` and decompress before using the existing dump
-parser. Plain `.txt`/`.dump` remains supported. Invalid/corrupted compressed
-archives cause an explicit error. Decompressed input is bounded to 1 GiB in the
-current materializing Import/Diff implementation.
+Existing saved profiles with `export_compression=xz` are migrated to ZIP on
+load. Their `xz_level` is used as the initial ZIP level until the profile is
+saved, then `zip_level` replaces `xz_level`. No new XZ exports are produced.
+Import and Diff **continue to read legacy `.xz` files**, using `lzma` only
+for backward compatibility, alongside plain dumps and new `.zip` dumps.
 
-Compression is lossless, but does **not** reduce LLM token use when the entire
-uncompressed source must be supplied to a model. It reduces storage and upload
-size. Existing `.patch` workflows, patch receipts and source patch application
-are unchanged.
+ZIP import accepts a single, unencrypted, path-free dump member, read entirely
+in memory without writing archive members to disk. Corrupted, encrypted,
+multi-member or unsafe-path archives are rejected. Import/Diff enforce a 1 GiB
+maximum decompressed payload for ZIP and legacy XZ.
+
+Compression is lossless. The change reduces the size of files transferred,
+not the tokens needed to analyze their full decompressed content. The Apply
+Patch engine, patch receipts and the GitHub Actions build workflow are not
+changed. **Switching XZ to ZIP does not establish that any existing antivirus
+alert was a false positive or remove the need to investigate it.**
 
 ---
 

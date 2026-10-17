@@ -12,6 +12,7 @@ import configparser
 import json
 import hashlib
 import lzma
+import zipfile
 import difflib
 import html as html_lib
 import tempfile
@@ -47,15 +48,19 @@ EXPORT_FORMAT_VALUES = (EXPORT_FORMAT_STANDARD, EXPORT_FORMAT_LLM)
 DEFAULT_EXPORT_FORMAT = EXPORT_FORMAT_STANDARD
 LLM_OUTPUT_SUFFIX = "_LLM"
 EXPORT_COMPRESSION_NONE = "none"
-EXPORT_COMPRESSION_XZ = "xz"
-EXPORT_COMPRESSION_VALUES = (EXPORT_COMPRESSION_NONE, EXPORT_COMPRESSION_XZ)
+EXPORT_COMPRESSION_ZIP = "zip"
+EXPORT_COMPRESSION_VALUES = (EXPORT_COMPRESSION_NONE, EXPORT_COMPRESSION_ZIP)
 DEFAULT_EXPORT_COMPRESSION = EXPORT_COMPRESSION_NONE
-DEFAULT_XZ_LEVEL = "6"
+DEFAULT_ZIP_LEVEL = "6"
 MAX_DUMP_DECOMPRESSED_BYTES = 1024 * 1024 * 1024
+_DUMP_COMPRESSION_SUFFIXES = (".zip", ".xz")
 
 
 def normalize_export_compression(value: str, *, strict: bool = False) -> str:
     normalized = str(value or DEFAULT_EXPORT_COMPRESSION).strip().lower()
+    # Existing XZ-enabled profiles migrate to ZIP, not to disabled compression.
+    if normalized == "xz":
+        return EXPORT_COMPRESSION_ZIP
     if normalized in EXPORT_COMPRESSION_VALUES:
         return normalized
     if strict:
@@ -63,7 +68,7 @@ def normalize_export_compression(value: str, *, strict: bool = False) -> str:
     return DEFAULT_EXPORT_COMPRESSION
 
 
-def normalize_xz_level(value: str, *, strict: bool = False) -> int:
+def normalize_zip_level(value: str, *, strict: bool = False) -> int:
     try:
         level = int(str(value).strip())
         if 0 <= level <= 9:
@@ -71,42 +76,75 @@ def normalize_xz_level(value: str, *, strict: bool = False) -> int:
     except (TypeError, ValueError):
         pass
     if strict:
-        raise ValueError("XZ compression level must be an integer from 0 to 9.")
-    return int(DEFAULT_XZ_LEVEL)
+        raise ValueError("ZIP compression level must be an integer from 0 to 9.")
+    return int(DEFAULT_ZIP_LEVEL)
 
 
-def _without_xz_suffix(path: Path) -> Path:
-    return path.with_suffix("") if path.suffix.lower() == ".xz" else path
+def _dump_envelope_suffix(path: Path) -> str:
+    suffix = path.suffix.lower()
+    return suffix if suffix in _DUMP_COMPRESSION_SUFFIXES else ""
+
+
+def _without_compression_suffix(path: Path) -> Path:
+    return path.with_suffix("") if _dump_envelope_suffix(path) else path
+
+
+def _with_envelope_suffix(path: Path, suffix: str) -> Path:
+    return Path(str(path) + suffix) if suffix else path
 
 
 def apply_export_compression_suffix(path: Path, compression: str) -> Path:
     compression = normalize_export_compression(compression, strict=True)
-    base = _without_xz_suffix(path)
-    return Path(str(base) + ".xz") if compression == EXPORT_COMPRESSION_XZ else base
+    base = _without_compression_suffix(path)
+    return _with_envelope_suffix(base, ".zip" if compression == EXPORT_COMPRESSION_ZIP else "")
+
+
+def _read_limited_dump_stream(stream) -> str:
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := stream.read(1024 * 1024):
+        total += len(chunk)
+        if total > MAX_DUMP_DECOMPRESSED_BYTES:
+            raise ValueError("Compressed dump exceeds the 1 GiB decompressed safety limit.")
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8-sig", errors="replace")
 
 
 def read_dump_text(path: Path) -> str:
-    """Read DumpIt .txt/.dump or lossless XZ without affecting patch-file handling."""
-    if path.suffix.lower() != ".xz":
+    """Read plain, ZIP, and legacy XZ dumps without changing patch-file handling."""
+    suffix = _dump_envelope_suffix(path)
+    if not suffix:
         return read_text_safely(path)
-    # Limit expansion before decoding so malformed/untrusted archives cannot
-    # expand indefinitely in memory. The current importer materializes text.
+    if suffix == ".xz":
+        try:
+            with lzma.open(path, "rb") as stream:
+                return _read_limited_dump_stream(stream)
+        except (lzma.LZMAError, EOFError) as exc:
+            raise ValueError(f"Invalid or corrupted XZ dump: {path}") from exc
+
     try:
-        chunks: list[bytes] = []
-        total = 0
-        with lzma.open(path, "rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                total += len(chunk)
-                if total > MAX_DUMP_DECOMPRESSED_BYTES:
-                    raise ValueError("Compressed dump exceeds the 1 GiB decompressed safety limit.")
-                chunks.append(chunk)
-        return b"".join(chunks).decode("utf-8-sig", errors="replace")
-    except (lzma.LZMAError, EOFError) as exc:
-        raise ValueError(f"Invalid or corrupted XZ dump: {path}") from exc
+        with zipfile.ZipFile(path, mode="r") as archive:
+            members = archive.infolist()
+            if len(members) != 1:
+                raise ValueError("ZIP dump must contain exactly one text dump file.")
+            member = members[0]
+            # Never extract to disk; reject directories or nested/archive paths.
+            if (member.is_dir() or not member.filename or
+                    "/" in member.filename or "\\" in member.filename or
+                    member.filename in {".", ".."}):
+                raise ValueError("ZIP dump member must be a single regular file with no path.")
+            if member.flag_bits & 0x1:
+                raise ValueError("Encrypted ZIP dumps are not supported.")
+            if member.file_size > MAX_DUMP_DECOMPRESSED_BYTES:
+                raise ValueError("Compressed dump exceeds the 1 GiB decompressed safety limit.")
+            with archive.open(member, mode="r") as stream:
+                return _read_limited_dump_stream(stream)
+    except (zipfile.BadZipFile, EOFError, RuntimeError, OSError, NotImplementedError) as exc:
+        raise ValueError(f"Invalid or corrupted ZIP dump: {path}") from exc
 
 
-def _write_xz_dump_atomic(out_path: Path, content: str, level: int) -> None:
-    """Publish only fully written XZ output, leaving prior export on failure."""
+def _write_zip_dump_atomic(out_path: Path, content: str, level: int) -> None:
+    """Publish a single-member ZIP only after successful completion."""
     ensure_parent_dir(out_path)
     tmp_path: Path | None = None
     try:
@@ -115,13 +153,14 @@ def _write_xz_dump_atomic(out_path: Path, content: str, level: int) -> None:
             dir=out_path.parent, delete=False,
         ) as temp_file:
             tmp_path = Path(temp_file.name)
-            with lzma.LZMAFile(temp_file, mode="wb", preset=level) as compressed:
-                compressed.write(content.encode("utf-8"))
+            with zipfile.ZipFile(
+                temp_file, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=level,
+            ) as archive:
+                archive.writestr(out_path.with_suffix("").name, content.encode("utf-8"))
         os.replace(tmp_path, out_path)
     finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
-
 
 
 def normalize_export_format(value: str, *, strict: bool = False) -> str:
@@ -3017,22 +3056,18 @@ def build_default_output(root: Path, add_ts: bool = False) -> Path:
 
 
 def get_output_base_path(path: Path) -> Path:
-    plain = _without_xz_suffix(path)
+    envelope = _dump_envelope_suffix(path)
+    plain = _without_compression_suffix(path)
     stem = strip_output_timestamp_from_stem(plain.stem)
-    base = plain.with_name(f"{stem}{plain.suffix}")
-    return apply_export_compression_suffix(
-        base, EXPORT_COMPRESSION_XZ if path.suffix.lower() == ".xz" else EXPORT_COMPRESSION_NONE
-    )
+    return _with_envelope_suffix(plain.with_name(f"{stem}{plain.suffix}"), envelope)
 
 
 def add_timestamp_to_output_path(path: Path, now: datetime | None = None) -> Path:
     base = get_output_base_path(path)
-    plain = _without_xz_suffix(base)
+    envelope = _dump_envelope_suffix(base)
+    plain = _without_compression_suffix(base)
     ts = (now or datetime.now()).strftime(TIMESTAMP_FORMAT)
-    renamed = plain.with_name(f"{plain.stem}_{ts}{plain.suffix}")
-    return apply_export_compression_suffix(
-        renamed, EXPORT_COMPRESSION_XZ if path.suffix.lower() == ".xz" else EXPORT_COMPRESSION_NONE
-    )
+    return _with_envelope_suffix(plain.with_name(f"{plain.stem}_{ts}{plain.suffix}"), envelope)
 
 
 def apply_export_format_output_suffix(path: Path, export_format: str) -> Path:
@@ -3040,10 +3075,10 @@ def apply_export_format_output_suffix(path: Path, export_format: str) -> Path:
     if normalized == EXPORT_FORMAT_STANDARD:
         return path
 
-    # An XZ envelope never alters the logical LLM filename suffix.
-    if path.suffix.lower() == ".xz":
-        return apply_export_compression_suffix(
-            apply_export_format_output_suffix(_without_xz_suffix(path), normalized), EXPORT_COMPRESSION_XZ
+    envelope = _dump_envelope_suffix(path)
+    if envelope:
+        return _with_envelope_suffix(
+            apply_export_format_output_suffix(_without_compression_suffix(path), normalized), envelope
         )
 
     match = TIMESTAMP_STEM_RE.match(path.stem or "")
@@ -3068,7 +3103,7 @@ def resolve_export_output_path(
 ) -> Path:
     raw_output_file = normalize_ui_path(raw_output_file or "")
     base_path = Path(raw_output_file).resolve() if raw_output_file else build_default_output(root, False)
-    base_path = apply_export_format_output_suffix(_without_xz_suffix(base_path), export_format)
+    base_path = apply_export_format_output_suffix(_without_compression_suffix(base_path), export_format)
     if add_timestamp:
         base_path = add_timestamp_to_output_path(base_path)
     return apply_export_compression_suffix(base_path, compression)
@@ -3076,8 +3111,8 @@ def resolve_export_output_path(
 
 def timestamped_output_regex(base_path: Path) -> re.Pattern[str]:
     base = get_output_base_path(base_path)
-    plain = _without_xz_suffix(base)
-    suffix = plain.suffix + (".xz" if base.suffix.lower() == ".xz" else "")
+    plain = _without_compression_suffix(base)
+    suffix = plain.suffix + _dump_envelope_suffix(base)
     return re.compile(
         r"^"
         + re.escape(plain.stem)
@@ -3106,7 +3141,7 @@ def collect_timestamped_output_files(path: Path) -> list[Path]:
 
 
 def _output_format_variant_bases(out_path: Path) -> tuple[Path, Path]:
-    base = _without_xz_suffix(get_output_base_path(out_path))
+    base = _without_compression_suffix(get_output_base_path(out_path))
     if base.stem.lower().endswith(LLM_OUTPUT_SUFFIX.lower()):
         other_stem = base.stem[:-len(LLM_OUTPUT_SUFFIX)]
     else:
@@ -3117,12 +3152,12 @@ def _output_format_variant_bases(out_path: Path) -> tuple[Path, Path]:
 
 def build_output_exclude_files(out_path: Path, add_timestamp: bool) -> set[str]:
     base, other_base = _output_format_variant_bases(out_path)
-    # Exclude both formats and both physical compression envelopes regardless
-    # of the currently selected profile mode, including timestamped siblings.
-    variants = (
-        base, other_base,
-        apply_export_compression_suffix(base, EXPORT_COMPRESSION_XZ),
-        apply_export_compression_suffix(other_base, EXPORT_COMPRESSION_XZ),
+    # Exclude plain, ZIP and legacy XZ dumps (including Standard/LLM siblings)
+    # so switching compression modes never self-includes an older export.
+    variants = tuple(
+        _with_envelope_suffix(path, envelope)
+        for path in (base, other_base)
+        for envelope in ("", ".zip", ".xz")
     )
     exclude_files = {canon_path(out_path)} | {canon_path(path) for path in variants}
     if add_timestamp:
@@ -3423,11 +3458,11 @@ def export_to_file(
     exclude_files: Optional[Set[str]] = None,
     export_format: str = DEFAULT_EXPORT_FORMAT,
     compression: str = DEFAULT_EXPORT_COMPRESSION,
-    xz_level: int = int(DEFAULT_XZ_LEVEL),
+    zip_level: int = int(DEFAULT_ZIP_LEVEL),
 ) -> tuple[int, int]:
     compression = normalize_export_compression(compression, strict=True)
-    level = normalize_xz_level(xz_level, strict=True)
-    if (out_path.suffix.lower() == ".xz") != (compression == EXPORT_COMPRESSION_XZ):
+    level = normalize_zip_level(zip_level, strict=True)
+    if _dump_envelope_suffix(out_path) != (".zip" if compression == EXPORT_COMPRESSION_ZIP else "") :
         raise ValueError("Export output extension must match selected compression mode.")
     if exclude_files is None:
         exclude_files = {canon_path(out_path)}
@@ -3459,8 +3494,8 @@ def export_to_file(
             entries=entries,
         )
 
-    if compression == EXPORT_COMPRESSION_XZ:
-        _write_xz_dump_atomic(out_path, content, level)
+    if compression == EXPORT_COMPRESSION_ZIP:
+        _write_zip_dump_atomic(out_path, content, level)
     else:
         ensure_parent_dir(out_path)
         out_path.write_text(content, encoding="utf-8")
@@ -4348,7 +4383,7 @@ class DumpItApp(tk.Tk):
         self.header_full_path = tk.BooleanVar(value=False)
         self.export_format = tk.StringVar(value=DEFAULT_EXPORT_FORMAT)
         self.export_compression = tk.StringVar(value=DEFAULT_EXPORT_COMPRESSION)
-        self.xz_level = tk.StringVar(value=DEFAULT_XZ_LEVEL)
+        self.zip_level = tk.StringVar(value=DEFAULT_ZIP_LEVEL)
         self.output_file = tk.StringVar(value="")
 
         # Profiles
@@ -4704,9 +4739,9 @@ class DumpItApp(tk.Tk):
             options, textvariable=self.export_compression,
             values=EXPORT_COMPRESSION_VALUES, state="readonly", width=7,
         ).grid(row=1, column=4, sticky="w", padx=3, pady=1)
-        ttk.Label(options, text="XZ level").grid(row=1, column=5, sticky="e", padx=3, pady=1)
+        ttk.Label(options, text="ZIP level").grid(row=1, column=5, sticky="e", padx=3, pady=1)
         ttk.Combobox(
-            options, textvariable=self.xz_level,
+            options, textvariable=self.zip_level,
             values=tuple(str(i) for i in range(10)), state="readonly", width=3,
         ).grid(row=1, column=6, sticky="w", padx=3, pady=1)
 
@@ -4995,7 +5030,7 @@ class DumpItApp(tk.Tk):
                 "header_full_path": "False",
                 "export_format": DEFAULT_EXPORT_FORMAT,
                 "export_compression": DEFAULT_EXPORT_COMPRESSION,
-                "xz_level": DEFAULT_XZ_LEVEL,
+                "zip_level": DEFAULT_ZIP_LEVEL,
                 "import_dump_file": "",
                 "import_target_dir": "",
                 "import_overwrite": "True",
@@ -5065,7 +5100,7 @@ class DumpItApp(tk.Tk):
                 "header_full_path": "False",
                 "export_format": DEFAULT_EXPORT_FORMAT,
                 "export_compression": DEFAULT_EXPORT_COMPRESSION,
-                "xz_level": DEFAULT_XZ_LEVEL,
+                "zip_level": DEFAULT_ZIP_LEVEL,
                 "import_dump_file": "",
                 "import_target_dir": "",
                 "import_overwrite": "True",
@@ -5095,11 +5130,11 @@ class DumpItApp(tk.Tk):
             self.header_full_path.set(s.getboolean("header_full_path", fallback=False))
             self.export_format.set(normalize_export_format(s.get("export_format", DEFAULT_EXPORT_FORMAT)))
             compression_var = vars(self).get("export_compression")
-            level_var = vars(self).get("xz_level")
+            level_var = vars(self).get("zip_level")
             if compression_var is not None:
                 compression_var.set(normalize_export_compression(s.get("export_compression", DEFAULT_EXPORT_COMPRESSION)))
             if level_var is not None:
-                level_var.set(str(normalize_xz_level(s.get("xz_level", DEFAULT_XZ_LEVEL))))
+                level_var.set(str(normalize_zip_level(s.get("zip_level", s.get("xz_level", DEFAULT_ZIP_LEVEL)))))
 
             self.output_file.set(normalize_ui_path(s.get("output_file", "")))
             self.import_dump_file.set(normalize_ui_path(s.get("import_dump_file", "")))
@@ -5147,13 +5182,14 @@ class DumpItApp(tk.Tk):
         self._cp[sec_real]["header_full_path"] = str(self.header_full_path.get())
         self._cp[sec_real]["export_format"] = normalize_export_format(self.export_format.get())
         compression_var = vars(self).get("export_compression")
-        level_var = vars(self).get("xz_level")
+        level_var = vars(self).get("zip_level")
         self._cp[sec_real]["export_compression"] = normalize_export_compression(
             compression_var.get() if compression_var is not None else DEFAULT_EXPORT_COMPRESSION
         )
-        self._cp[sec_real]["xz_level"] = str(normalize_xz_level(
-            level_var.get() if level_var is not None else DEFAULT_XZ_LEVEL, strict=True
+        self._cp[sec_real]["zip_level"] = str(normalize_zip_level(
+            level_var.get() if level_var is not None else DEFAULT_ZIP_LEVEL, strict=True
         ))
+        self._cp[sec_real].pop("xz_level", None)
         self._cp[sec_real]["watch_poll_ms"] = self.watch_poll_ms.get().strip()
         self._cp[sec_real]["watch_quiet_ms"] = self.watch_quiet_ms.get().strip()
         self._cp[sec_real]["watch_export_on_start"] = str(self.watch_export_on_start.get())
@@ -5339,7 +5375,7 @@ class DumpItApp(tk.Tk):
         self.header_full_path.set(False)
         self.export_format.set(DEFAULT_EXPORT_FORMAT)
         self.export_compression.set(DEFAULT_EXPORT_COMPRESSION)
-        self.xz_level.set(DEFAULT_XZ_LEVEL)
+        self.zip_level.set(DEFAULT_ZIP_LEVEL)
         self.output_file.set("")
         self.import_dump_file.set("")
         self.import_target_dir.set(normalize_ui_path(self.project_dir.get()))
@@ -5434,7 +5470,7 @@ class DumpItApp(tk.Tk):
         f = filedialog.askopenfilename(
             title=title,
             initialdir=initialdir,
-            filetypes=[("DumpIt dumps", "*.txt *.dump *.txt.xz *.dump.xz"), ("XZ archives", "*.xz"), ("Patch files", "*.patch"), ("All files", "*.*")],
+            filetypes=[("DumpIt dumps", "*.txt *.dump *.txt.zip *.dump.zip *.txt.xz *.dump.xz"), ("ZIP archives", "*.zip"), ("Legacy XZ archives", "*.xz"), ("Patch files", "*.patch"), ("All files", "*.*")],
         )
         if f:
             target.set(normalize_ui_path(f))
@@ -6193,7 +6229,7 @@ class DumpItApp(tk.Tk):
         f = filedialog.askopenfilename(
             title="Select DumpIt dump file",
             initialdir=initialdir,
-            filetypes=[("DumpIt dumps", "*.txt *.dump *.txt.xz *.dump.xz"), ("XZ archives", "*.xz"), ("All files", "*.*")],
+            filetypes=[("DumpIt dumps", "*.txt *.dump *.txt.zip *.dump.zip *.txt.xz *.dump.xz"), ("ZIP archives", "*.zip"), ("Legacy XZ archives", "*.xz"), ("All files", "*.*")],
         )
         if f:
             self.import_dump_file.set(normalize_ui_path(f))
@@ -6643,11 +6679,11 @@ class DumpItApp(tk.Tk):
         out = normalize_ui_path(self.output_file.get().strip())
         export_format = normalize_export_format(self.export_format.get(), strict=True)
         compression_var = vars(self).get("export_compression")
-        level_var = vars(self).get("xz_level")
+        level_var = vars(self).get("zip_level")
         compression = normalize_export_compression(
             compression_var.get() if compression_var is not None else DEFAULT_EXPORT_COMPRESSION, strict=True
         )
-        xz_level = normalize_xz_level(level_var.get() if level_var is not None else DEFAULT_XZ_LEVEL, strict=True)
+        zip_level = normalize_zip_level(level_var.get() if level_var is not None else DEFAULT_ZIP_LEVEL, strict=True)
         out_path = resolve_export_output_path(root, out, add_timestamp, export_format, compression)
         exclude_files = build_output_exclude_files(out_path, add_timestamp)
 
@@ -6662,7 +6698,7 @@ class DumpItApp(tk.Tk):
             exclude_files=exclude_files,
             export_format=export_format,
             compression=compression,
-            xz_level=xz_level,
+            zip_level=zip_level,
         )
 
         deleted_old = 0
@@ -6860,15 +6896,15 @@ class DumpItApp(tk.Tk):
         # Separate from the legacy 9-item settings tuple used by Batch callers.
         cp = vars(self).get("_cp")
         if cp is None:
-            return DEFAULT_EXPORT_COMPRESSION, int(DEFAULT_XZ_LEVEL)
+            return DEFAULT_EXPORT_COMPRESSION, int(DEFAULT_ZIP_LEVEL)
         section = f"{PROFILE_PREFIX}{name}"
         actual = next((key for key in cp.sections() if key.lower() == section.lower()), section)
         if actual not in cp:
-            return DEFAULT_EXPORT_COMPRESSION, int(DEFAULT_XZ_LEVEL)
+            return DEFAULT_EXPORT_COMPRESSION, int(DEFAULT_ZIP_LEVEL)
         profile = cp[actual]
         return (
             normalize_export_compression(profile.get("export_compression", DEFAULT_EXPORT_COMPRESSION)),
-            normalize_xz_level(profile.get("xz_level", DEFAULT_XZ_LEVEL), strict=True),
+            normalize_zip_level(profile.get("zip_level", profile.get("xz_level", DEFAULT_ZIP_LEVEL)), strict=True),
         )
 
     def _set_batch_running(self, running: bool) -> None:
@@ -6928,7 +6964,7 @@ class DumpItApp(tk.Tk):
             else:
                 # Legacy test/dummy application objects may supply only the
                 # original saved-settings tuple, with no profile config.
-                compression, xz_level = DumpItApp._read_profile_compression(self, name)
+                compression, zip_level = DumpItApp._read_profile_compression(self, name)
                 included, skipped = export_to_file(
                     root=root,
                     out_path=out_path,
@@ -6940,7 +6976,7 @@ class DumpItApp(tk.Tk):
                     exclude_files=build_output_exclude_files(out_path, add_timestamp),
                     export_format=export_format,
                     compression=compression,
-                    xz_level=xz_level,
+                    zip_level=zip_level,
                 )
                 cleanup_msg = ""
                 if add_timestamp:
